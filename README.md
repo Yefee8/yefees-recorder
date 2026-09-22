@@ -39,6 +39,7 @@ yefees-recorder record --window "Firefox"            # one window
 yefees-recorder record --region 0,0,1280x720         # an area, as x,y,WIDTHxHEIGHT
 yefees-recorder record --audio-device "Speakers"     # a specific audio source
 yefees-recorder record -q high                       # low | balanced | high
+yefees-recorder record --pick                        # choose from a menu instead
 ```
 
 Recording the whole desktop is the default, which on a multi-monitor machine
@@ -68,6 +69,26 @@ uv sync
 uv run yefees-recorder --help
 uv run pytest
 ```
+
+## Configuration
+
+Flags always win; the config file only supplies what you leave out.
+
+```
+yefees-recorder config          # where it lives and what is in effect
+yefees-recorder config --init   # write a commented starter file
+```
+
+```toml
+output_dir = "~/Videos"
+fps = 30
+quality = "balanced"
+audio = true
+display = 0
+```
+
+Set `YEFEES_RECORDER_CONFIG` to use a different file. A broken or misspelled
+setting is reported and skipped rather than stopping the recording.
 
 ## License
 

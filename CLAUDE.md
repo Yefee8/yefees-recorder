@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Phases 1 (backends), 2 (source and quality selection), 5 (CI matrix) and 6 (release plumbing) are done. Phases 3 and 4 (config file, hotkeys) are not started. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
+Phases 1 (backends), 2 (source and quality selection), 3 (config file and menu), 5 (CI matrix) and 6 (release plumbing) are done. Only phase 4 (hotkeys) is left. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
 
 Verification status per platform:
 
@@ -89,6 +89,18 @@ Things that bite here:
 - **`--window` with x11grab must not also pass `-video_size`** — the window's own size wins.
 
 Quality is `low`/`balanced`/`high` mapping to an x264 preset plus CRF. Even `high` stays at `medium` rather than a slow preset: capture is realtime, and dropping frames costs more than bitrate does. Measured on 4s of 1920x1080: 127 / 278 / 323 KiB.
+
+## Config and precedence
+
+`config.py` resolves **flag > config file > built-in default**. The mechanism that makes this work: every overridable `typer.Option` in `record` defaults to `None`, because otherwise there is no way to tell `--fps 30` from "the user said nothing". If you add a setting, it needs a `None` default, an entry in `DEFAULTS`, and an entry in `TYPES`.
+
+- **`TYPES` checks `bool` before `int` deliberately.** `bool` subclasses `int` in Python, so a plain `isinstance(value, int)` would happily accept `display = true`.
+- **`audio = false` must survive resolution.** `resolve()` tests `flag_value is not None` rather than truthiness, or a configured `false` would be read as "unset" and flipped back on.
+- **A bad config never stops a recording** — offending keys are dropped, reported as warnings, and the defaults take over.
+- `--init` writes a fixed commented template rather than serialising parsed data, which avoids needing a TOML *writer* and cannot eat the user's comments. A test parses that template back to prove it is valid TOML and that everything in it is commented out.
+- `$YEFEES_RECORDER_CONFIG` overrides the path; the tests rely on it, so don't remove it.
+
+`--pick` shows a `rich` menu of displays and windows (never audio) and returns a `(display, window)` pair. It refuses to run without a TTY and refuses to combine with an explicit `--display/--window/--region`.
 
 ## CI
 

@@ -25,6 +25,8 @@ dependencies = [
     "typer>=0.15",
     "rich>=13.9",
     "pyaudiowpatch>=0.2.12.8; sys_platform == 'win32'",
+    "platformdirs>=4.11.12",
+    "tomli>=2.4.1 ; python_full_version < '3.11'",
 ]
 
 [project.urls]

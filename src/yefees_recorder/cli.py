@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import sys
 import time
 from importlib.metadata import version as _pkg_version
 from datetime import datetime
@@ -13,8 +14,10 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.prompt import IntPrompt
 from rich.table import Table
 
+from . import config as user_config
 from .capture import get_backend, list_sources, parse_region
 
 app = typer.Typer(help="Cross-platform screen recorder built on mpv.", no_args_is_help=True)
@@ -111,19 +114,18 @@ def doctor() -> None:
 @app.command()
 def record(
     output: Path = typer.Option(None, "-o", "--output", help="Output file (default: recording-<timestamp>.mp4)."),
-    fps: int = typer.Option(30, "--fps", help="Capture framerate."),
-    audio: bool = typer.Option(True, "--audio/--no-audio", help="Capture system audio."),
+    fps: int = typer.Option(None, "--fps", help="Capture framerate. [default: 30]"),
+    audio: bool = typer.Option(None, "--audio/--no-audio", help="Capture system audio. [default: on]"),
     duration: float = typer.Option(0, "-d", "--duration", help="Stop after N seconds (0 = until Ctrl+C)."),
-    quality: Quality = typer.Option(Quality.balanced, "-q", "--quality", help="Encoding quality."),
+    quality: Quality = typer.Option(None, "-q", "--quality", help="Encoding quality. [default: balanced]"),
     display: int = typer.Option(None, "--display", help="Record one monitor (see `sources`)."),
     window: str = typer.Option(None, "--window", help="Record one window by title (see `sources`)."),
     region: str = typer.Option(None, "--region", help="Record an area, as x,y,WIDTHxHEIGHT."),
     audio_device: str = typer.Option(None, "--audio-device", help="Audio source to record (see `sources`)."),
-    audio_offset: float = typer.Option(0.0, "--audio-offset", help="Shift audio by N seconds if it drifts on your machine."),
+    audio_offset: float = typer.Option(None, "--audio-offset", help="Shift audio by N seconds if it drifts. [default: 0]"),
+    pick: bool = typer.Option(False, "--pick", help="Choose what to record from a menu."),
 ) -> None:
     """Record the screen."""
-    if output is None:
-        output = Path(f"recording-{datetime.now():%Y%m%d-%H%M%S}.mp4")
     if sum(x is not None for x in (display, window, region)) > 1:
         console.print("[red]Pick only one of --display, --window and --region.[/]")
         raise typer.Exit(1)
@@ -133,13 +135,36 @@ def record(
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(1)
 
+    settings, complaints = user_config.load()
+    for complaint in complaints:
+        console.print(f"[yellow]{complaint}[/]")
+
+    if pick:
+        if display is not None or window is not None or area is not None:
+            console.print("[red]--pick chooses the source, so don't also pass one.[/]")
+            raise typer.Exit(1)
+        display, window = _pick_source()
+
+    fps = user_config.resolve("fps", fps, settings)
+    audio = user_config.resolve("audio", audio, settings)
+    audio_offset = user_config.resolve("audio_offset", audio_offset, settings)
+    audio_device = user_config.resolve("audio_device", audio_device, settings)
+    quality_name = user_config.resolve("quality", quality.value if quality else None, settings)
+    if display is None and window is None and area is None:
+        display = user_config.resolve("display", None, settings)
+
+    if output is None:
+        directory = user_config.resolve("output_dir", None, settings)
+        folder = Path(directory).expanduser() if directory else Path.cwd()
+        output = folder / f"recording-{datetime.now():%Y%m%d-%H%M%S}.mp4"
+
     try:
         backend = get_backend(
             output, fps=fps, audio=audio, audio_offset=audio_offset,
-            quality=quality.value, display=display, window=window,
+            quality=quality_name, display=display, window=window,
             region=area, audio_device=audio_device,
         )
-    except NotImplementedError as exc:
+    except (NotImplementedError, ValueError) as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(1)
 
@@ -195,4 +220,66 @@ def sources() -> None:
             )
             # The label only earns a column when it says more than the id does.
             table.add_row(kind, flag, source.name if source.name != source.id else "")
+    console.print(table)
+
+
+def _pick_source() -> tuple[int | None, str | None]:
+    """Show the source menu and return the chosen (display, window)."""
+    if not sys.stdin.isatty():
+        console.print("[red]--pick needs an interactive terminal.[/]")
+        raise typer.Exit(1)
+    try:
+        found = [s for s in list_sources() if s.kind in ("display", "window")]
+    except NotImplementedError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    table = Table(title="What should I record?")
+    table.add_column("#", justify="right")
+    table.add_column("kind")
+    table.add_column("name")
+    table.add_row("0", "screen", "Everything (all monitors)")
+    for number, source in enumerate(found, start=1):
+        table.add_row(str(number), source.kind, source.name)
+    console.print(table)
+
+    choice = IntPrompt.ask(
+        "Record which?",
+        choices=[str(i) for i in range(len(found) + 1)],
+        show_choices=False,
+        default=0,
+    )
+    if choice == 0:
+        return None, None
+    chosen = found[choice - 1]
+    if chosen.kind == "display":
+        return int(chosen.id), None
+    return None, chosen.id
+
+
+@app.command()
+def config(
+    init: bool = typer.Option(False, "--init", help="Write a commented config file if none exists."),
+) -> None:
+    """Show where settings are read from, and what is in effect."""
+    path = user_config.config_path()
+    if init:
+        if path.exists():
+            console.print(f"[yellow]Already exists, leaving it alone:[/] {path}")
+        else:
+            console.print(f"[green]Created[/] {user_config.write_template()}")
+
+    settings, complaints = user_config.load()
+    for complaint in complaints:
+        console.print(f"[yellow]{complaint}[/]")
+
+    suffix = "" if path.exists() else "  (not created yet — run `config --init`)"
+    table = Table(title=f"{path}{suffix}")
+    table.add_column("setting")
+    table.add_column("value")
+    table.add_column("from")
+    for key, default in user_config.DEFAULTS.items():
+        configured = key in settings
+        value = settings[key] if configured else default
+        table.add_row(key, "-" if value is None else str(value), "config file" if configured else "default")
     console.print(table)
