@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Phase 1 (all three backends), phase 5 (CI matrix) and phase 6 (release plumbing) are done. Phases 2, 3 and 4 (source/quality selection, config file, hotkeys) are not started. Nothing has been pushed to a remote yet and nothing has been published — no release has ever run.
+Phase 1 (all three backends), phase 5 (CI matrix) and phase 6 (release plumbing) are done. Phases 2, 3 and 4 (source/quality selection, config file, hotkeys) are not started. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
 
 Verification status per platform:
 
@@ -87,7 +87,7 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 
 1. A **pending** Trusted Publisher on PyPI (pypi.org > Your projects > Publishing). It must be "pending" because the project does not exist on PyPI yet — a normal trusted publisher can only be added to a project that already has a release. Fill in repo owner, repo name, workflow `release.yml`, environment `pypi`.
 2. A GitHub environment named **`pypi`**, matching the `environment:` in the workflow.
-3. `project.urls` in `pyproject.toml` — deliberately left out because the repo has no remote yet, so any URL would be a guess.
+3. Nothing else — `project.urls` points at `github.com/Yefee8/yefees-recorder`, taken from the configured remote.
 
 The name `yefees-recorder` was free on PyPI as of the phase 6 commit.
 

@@ -27,6 +27,11 @@ dependencies = [
     "pyaudiowpatch>=0.2.12.8; sys_platform == 'win32'",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Yefee8/yefees-recorder"
+Repository = "https://github.com/Yefee8/yefees-recorder"
+Issues = "https://github.com/Yefee8/yefees-recorder/issues"
+
 [project.scripts]
 yefees-recorder = "yefees_recorder.cli:app"
 
