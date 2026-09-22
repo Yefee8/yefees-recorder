@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Phases 0, 1c (Windows) and 1a (Linux) are done. macOS (1b) is not implemented — `get_backend()` raises `NotImplementedError` for it.
+Phase 1 is complete: Windows (1c), Linux (1a) and macOS (1b) backends all exist. Phases 2–6 (source/quality selection, CLI polish, hotkeys, CI, release) are not started.
 
-**Windows is the only backend verified against real hardware.** The Linux backends are unit-tested at the command-construction level only; nobody has yet run an actual X11 or Wayland capture. Treat the first real Linux run as a debugging session, not a smoke test.
+**Windows is the only backend verified against real hardware.** Linux and macOS are unit-tested at the command-construction level only — no X11, Wayland or avfoundation capture has ever been run. Treat the first real run on either as a debugging session, not a smoke test.
 
 `plan.md` (gitignored, Turkish) holds the phase order and remains the roadmap, **but its central technical premise turned out to be wrong — see "Why not mpv" below.** Trust this file over `plan.md` on engine choice.
 
@@ -54,12 +54,17 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 - **Record the sink's `.monitor`, not the default source** — the plain default PulseAudio source is the microphone, not system audio.
 - **The loopback wav is built against wall clock, not against the device.** Windows only feeds a loopback stream while something is actually playing — on a fully silent machine the callback never fires at all, and mid-recording silence produces gaps. `WasapiLoopbackRecorder` therefore pads with real silence up to the elapsed-time position on every callback and again at stop. Removing that padding silently desyncs audio from video. Measured after the fix: beeps 4.000 s apart in the source land 3.998 / 4.001 / 3.998 s apart in the output.
 - **`--audio-offset` is a deliberate calibration knob**, not dead config: residual constant A/V offset depends on how fast a given machine's audio endpoint spins up.
-- **macOS has no native system-audio loopback** — it needs a virtual device like BlackHole. First run also needs Screen Recording (TCC) permission; without it capture silently records black frames, so detect and explain rather than failing mutely.
+- **macOS records black frames rather than erroring when Screen Recording permission is missing.** `screen_recording_permitted()` checks `CGPreflightScreenCaptureAccess` through ctypes (no dependency) before capture starts. It returns `None` when it cannot tell — treat only an explicit `False` as denied, or non-macOS machines would refuse to record. Granting permission only affects newly launched processes, so the terminal has to be restarted.
+- **macOS has no native system-audio loopback** — it needs a virtual device like BlackHole, which appears as an avfoundation *input*. Missing one downgrades to video-only rather than failing.
+- **avfoundation uses two separate inputs**, `screen:none` and `none:audio`, not the combined `screen:audio` form, which drifts between the streams.
+- **Device indices are discovered, never hardcoded** — `-list_devices` writes to stderr and exits non-zero by design, so the exit code is ignored and stderr is parsed. The camera is usually index 0 and the screen 1, and the microphone sits at audio 0 ahead of the loopback device, so picking index 0 gets you a webcam and a mic.
 - **Wayland source selection cannot be automated** — the `xdg-desktop-portal` dialog is an OS security boundary and the user must pick the screen/window there.
 - Backend selection is `platform.system()` plus `XDG_SESSION_TYPE` on Linux, in `get_backend()`.
 
 ## Working style for this repo
 
 Phases in `plan.md` §5 are separate commits, and the backend phases are built and tested one at a time — do not debug all three platforms in one pass. 1c was done before 1a/1b because the only machine available is Windows.
+
+Errors meant for the user (missing wf-recorder, denied permission) are raised as `RuntimeError` from `capture_command`, which surfaces at `backend.start()`. `cli.record` catches `RuntimeError` there — without that catch the carefully written help text prints as a traceback.
 
 Verify recorder changes by measurement, not by "it produced a file": check both stream durations with `ffprobe` and check A/V alignment with a known-spacing tone (`aevalsrc` + `silencedetect`). Several bugs here produced perfectly valid files with wrong or missing audio.

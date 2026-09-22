@@ -7,7 +7,7 @@ Cross-platform screen recorder CLI. Windows and Linux are implemented; macOS is 
 | Windows | gdigrab | WASAPI loopback, no virtual cable needed |
 | Linux / X11 | x11grab | PulseAudio / PipeWire sink monitor |
 | Linux / Wayland | wf-recorder (wlroots only — not GNOME/KDE) | sink monitor |
-| macOS | not implemented | — |
+| macOS | avfoundation screen capture | BlackHole or similar virtual device |
 
 Only the Windows path has been tested on real hardware so far.
 
@@ -30,6 +30,11 @@ yefees-recorder record --no-audio --fps 60
 
 If audio ends up slightly ahead of or behind the video on your machine, nudge it
 with `--audio-offset 0.2`.
+
+On macOS you must grant Screen Recording permission to your terminal in System
+Settings > Privacy & Security, then restart it — without it macOS records black
+frames instead of reporting an error. System audio needs a loopback device
+(`brew install blackhole-2ch`); without one you get video only.
 
 On Wayland, ffmpeg cannot capture the screen — access is only available through
 xdg-desktop-portal/PipeWire — so `wf-recorder` is required. It supports wlroots

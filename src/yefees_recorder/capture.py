@@ -197,6 +197,8 @@ def get_backend(output: Path, **kwargs) -> CaptureBackend:
         wayland = os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
         backend = LinuxWaylandBackend if wayland else LinuxX11Backend
         return backend(output, **kwargs)
-    raise NotImplementedError(
-        f"{system} backend is not implemented yet (phase 1b) — Linux and Windows only for now."
-    )
+    if system == "Darwin":
+        from .macos import MacBackend
+
+        return MacBackend(output, **kwargs)
+    raise NotImplementedError(f"No backend for {system}.")

@@ -75,6 +75,22 @@ def doctor() -> None:
             missing.append(tool)
             table.add_row(tool, "[red]missing[/]", install_hint(tool))
 
+    if platform.system() == "Darwin":
+        from .macos import screen_recording_permitted
+
+        granted = screen_recording_permitted()
+        if granted:
+            table.add_row("screen recording", "[green]granted[/]", "")
+        elif granted is None:
+            table.add_row("screen recording", "[yellow]unknown[/]", "could not query CoreGraphics")
+        else:
+            missing.append("Screen Recording permission")
+            table.add_row(
+                "screen recording", "[red]denied[/]",
+                "System Settings > Privacy & Security > Screen Recording"
+                " (macOS records black frames without it)",
+            )
+
     console.print(table)
     if missing:
         console.print(f"[red]Missing: {', '.join(missing)}[/]")
@@ -99,9 +115,15 @@ def record(
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(1)
 
-    backend.start()
+    try:
+        backend.start()
+    except RuntimeError as exc:  # missing wf-recorder, denied permission, ...
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
     if audio and getattr(backend, "audio_error", None):
-        console.print("[yellow]No system audio device; recording video only.[/]")
+        console.print(f"[yellow]{backend.audio_error}[/]")
+        console.print("[yellow]Recording video only.[/]")
     console.print("[green]Recording[/] - press Ctrl+C to stop.")
     try:
         if duration > 0:

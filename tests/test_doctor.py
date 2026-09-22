@@ -36,3 +36,16 @@ def test_wayland_also_needs_wf_recorder(monkeypatch):
     assert required_tools() == ("ffmpeg", "wf-recorder")
     monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
     assert required_tools() == ("ffmpeg",)
+
+
+def test_record_reports_backend_errors_without_a_traceback(monkeypatch):
+    """The Wayland/permission help text is the whole point of those errors."""
+    class Failing:
+        def start(self):
+            raise RuntimeError("wf-recorder is not installed")
+
+    monkeypatch.setattr("yefees_recorder.cli.get_backend", lambda *a, **k: Failing())
+    result = runner.invoke(app, ["record", "-d", "1"])
+    assert result.exit_code == 1
+    assert "wf-recorder" in result.stdout
+    assert result.exception is None or isinstance(result.exception, SystemExit)
