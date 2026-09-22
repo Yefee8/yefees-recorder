@@ -1,19 +1,55 @@
-# macOS session plan
+# macOS session: what happened
 
-Hand this file to a session running on the Mac. Read `CLAUDE.md` first — this
-only covers what is specific to finishing macOS.
+This was a handoff plan for bringing up the macOS backend, which had never been
+run. It has been run now. The plan is kept below for the record; everything
+durable from it has moved into `CLAUDE.md`, which is where to look first.
 
-## Where things stand
+Run on macOS 14.5 (Apple silicon, one Retina display at 1710x1112 points /
+3420x2224 pixels) with ffmpeg 8.1.2 from Homebrew and BlackHole 2ch.
 
-`src/yefees_recorder/macos.py` is fully written and **has never been run**.
-Every other platform note in `CLAUDE.md` applies; the macOS-specific claims in
-it are reasoning, not measurements. Treat this as a debugging session, not a
-smoke test.
+## The test order, and how it went
 
-Windows is verified on real hardware. Linux X11 is verified in CI under Xvfb.
-Linux Wayland and macOS are the two unverified backends.
+| # | Step | Result |
+|---|---|---|
+| 1 | `doctor` | passed once permission was granted |
+| 2 | `sources` | passed unchanged — the parser handled ffmpeg 8.1.2's extra noise |
+| 3 | `record --no-audio` | passed after two fixes (pixel format, duration) |
+| 4 | denied permission | passed — and the assumption behind it was wrong |
+| 5 | system audio | **failed badly**, three separate faults |
+| 6 | microphone | passed on device selection; "audible" not verified |
+| 7 | both mixed | failed with 5, passed after |
+| 8 | `--display 1` | passed — single-monitor Mac, out-of-range error |
+| 9 | `--region` | passed; Retina caveat confirmed and documented |
+| 10 | `--window` | passed — refuses, points at `--region` |
+| 11 | pause / resume | passed, and exposed an audio alignment bug |
+| 12 | terminal closed | passed (SIGHUP and SIGTERM) |
+| 13 | `config --edit` | **failed** — arrow keys had never worked on POSIX |
 
-## Setup
+## What it cost
+
+Eight bugs, four of them in code shared with Linux:
+
+- `keys.raw_mode()` raised on a captured stdin, failing 27 tests on any POSIX machine.
+- `doctor`'s "all tools present" test depended on the machine having Screen Recording.
+- **Arrow keys never worked in any menu on macOS or Linux** — a buffered read left the escape sequence where `select` could not see it, so every arrow read as Esc and desynchronised the stream for good.
+- `read_key` spun at 382,637 calls a second once its input ended.
+- macOS asked the capture device for a pixel format no screen offers, printing an error block on every recording.
+- `--duration` came out a second short, because avfoundation needs 1.3s to produce its first frame.
+- Audio lost a quarter of its samples, could not share a process with the screen, and could not be mixed live.
+- The audio and the video did not start together, and which one was first varied by segment.
+
+## Still not verified
+
+- **"Audible" in steps 6 and 7.** The device selection, levels and timing are all measured, but the machine's output was muted, so nothing was played through the speakers and heard back. The absolute A/V offset is only bounded indirectly, by the two streams agreeing to 0.07s.
+- **`--display 1` on a real second monitor.** Only the out-of-range error was exercised.
+- **`--app-audio`**, which macOS refuses by design.
+- **Wayland**, which remains the one backend nobody has ever run.
+
+## The original plan
+
+Read `CLAUDE.md` first — this only covers what is specific to finishing macOS.
+
+### Setup
 
 ```bash
 brew install ffmpeg
@@ -35,77 +71,25 @@ then in Audio MIDI Setup create a Multi-Output Device containing BlackHole *and*
 the speakers, and select it as the system output. Without the multi-output you
 record the audio but stop hearing it.
 
-## Test order
+### The parser was expected to be the most fragile part
 
-Work down this list. Each step is written so a failure tells you which layer
-broke. Stop and fix before moving on — later steps assume earlier ones work.
+It was not. `list_avfoundation_devices()` scrapes
+`ffmpeg -f avfoundation -list_devices` from stderr, and ffmpeg 8.1.2 wraps it in
+more noise than the old sample had — an ObjC camera warning before the sections
+and an `[in#0 @ 0x...] Error opening input` line *inside* one. Neither confused
+`DEVICE_LINE`. The sample in `tests/test_macos.py` carries that noise now.
 
-| # | Command | Expected | If it fails |
-|---|---------|----------|-------------|
-| 1 | `doctor` | ffmpeg ok, screen recording granted | The permission row is the thing to trust; `granted` comes from `CGPreflightScreenCaptureAccess` |
-| 2 | `sources` | displays, audio, mic listed | **Highest-risk step** — see "The parser" below |
-| 3 | `record -d 5 --no-audio -o v.mp4` | ~5s, screen resolution | If black frames: permission, not code |
-| 4 | Revoke permission, `record` | Clear error, system prompt appears | Should never silently record black |
-| 5 | `record -d 5 -o a.mp4` | video + aac, audible system audio | Needs BlackHole selected as output |
-| 6 | `record -d 5 --mic --no-audio` | mic track, audible | Check it picked the mic, not BlackHole |
-| 7 | `record -d 5 --mic` | one mixed track, both audible | Verify system audio is not quieter than in step 5 |
-| 8 | `record -d 5 --display 1` | the second monitor | Single-monitor Macs: expect the out-of-range error |
-| 9 | `record -d 5 --region 0,0,640x480` | 640x480 | Retina — see below |
-| 10 | `record --window Safari` | Refuses, points at `--region` | This is intended, not a bug |
-| 11 | `record` then `p`, `p`, `q` | paused time cut out | Exercises segment + concat |
-| 12 | `record`, then close the terminal window | file still playable | SIGHUP path |
-| 13 | `config --edit` | menus readable, arrows work | Colours: see below |
+### Things the plan flagged, and what they turned out to be
 
-## The parser is the most fragile part
-
-`list_avfoundation_devices()` scrapes `ffmpeg -f avfoundation -list_devices`
-from **stderr**, and that command exits non-zero by design. Run it by hand
-first and compare with what `sources` prints:
-
-```bash
-ffmpeg -hide_banner -f avfoundation -list_devices true -i ""
-```
-
-If the format has drifted, fix `DEVICE_LINE` in `macos.py` and update the
-verbatim sample in `tests/test_macos.py` — that fixture is the regression test.
-
-Remember the indices: **video 0 is usually the FaceTime camera and audio 0 the
-built-in mic**, which is why `--display N` counts screens through
-`screen_device_indices()` rather than using the device index directly.
-
-## macOS-specific things to check
-
-- **Retina scaling.** avfoundation captures at the backing resolution, so a
-  "1440x900" display may record as 2880x1800. `--region` crops in *pixels*, not
-  points, so a region that looks right in Screenshot will be half the intended
-  size. Find out which it is in step 9 and, if it bites, document it in the
-  README rather than silently doubling numbers.
-- **`-capture_cursor 1`** is passed unconditionally and has never been run. If
-  ffmpeg rejects it, drop it or make it a flag.
-- **Framerate.** avfoundation may refuse arbitrary `-framerate` values on some
-  displays. If step 3 errors, try without `-framerate` before blaming anything
-  else.
-- **Pixel format.** avfoundation hands over `uyvy422`; the pipeline converts to
-  `yuv420p`. If ffmpeg complains about the conversion, that is where to look.
-- **Permission returning `None`.** `screen_recording_permitted()` returns
-  `None` when it cannot tell. Only an explicit `False` counts as denied — do
-  not "fix" it to treat `None` as denied, or non-macOS machines stop recording.
-- **Per-application audio is not possible** and should stay that way: it needs
-  Core Audio process taps, which ffmpeg cannot reach. The error already names
-  the virtual-device workaround.
-- **Terminal colours.** The menu accent is indigo `#5A4FCF` with the text
-  colour derived from its brightness. Terminal.app's default profile is dark;
-  if a light profile makes the selection unreadable, set a lighter accent
-  (`config --edit` → Menu colour) rather than changing the default for
-  everyone.
-
-## What to do with findings
-
-- Fix in `macos.py`, keep `tests/test_macos.py` passing, add a test for
-  anything the real output contradicted.
-- Update the verification table in `CLAUDE.md` — macOS should stop saying
-  "never run" once it has been.
-- Run the whole suite before committing: `uv run pytest`.
-- CI has a macOS job, but a hosted runner can never hold Screen Recording
-  permission, so its `doctor` step is deliberately allowed to fail. Do not
-  weaken `doctor` to make CI green.
+- **Retina scaling** — real. `--region` crops in backing pixels, so a region
+  looks half the intended size. Documented in the README rather than doubled.
+- **`-capture_cursor 1`** — accepted, no change needed.
+- **Framerate** — the plan expected `-framerate` to be refused. avfoundation
+  logs `Configuration of video device failed` no matter what it is given, and
+  applies the framerate anyway: 5 / 15 / 30 / 60 all landed within 0.3 fps.
+- **Pixel format** — the real problem, though not the one expected. See
+  CLAUDE.md.
+- **Permission returning `None`** — untouched, still only `False` counts.
+- **Per-application audio** — still impossible, still says so.
+- **Terminal colours** — the selection renders as bold white on the indigo, one
+  block across the whole row, and `readable_on()` picks the foreground.

@@ -1,5 +1,10 @@
-"""macOS backend wiring, tested against real `-list_devices` output. Nothing
-here needs a Mac; capturing an actual screen is still unverified."""
+"""macOS backend wiring, tested against real `-list_devices` output.
+
+Nothing here needs a Mac - the device list is a recorded sample - but the
+backend itself has now been run on one, and most of what these assert is a
+measurement from that session rather than a guess. The reasoning is in
+CLAUDE.md under "macOS audio" and "Duration on macOS".
+"""
 
 import platform
 import subprocess
