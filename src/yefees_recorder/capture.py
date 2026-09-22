@@ -209,9 +209,10 @@ class CaptureBackend(ABC):
     def audio_lead(self, video: Path, audio: Path) -> float:
         """Seconds by which a side recording starts before the video does.
 
-        Zero unless a backend opens its audio device faster than its capture
-        device, in which case the head of the wav is older than the first frame
-        and has to come off before the two are muxed together.
+        Negative when it starts after the video instead. Zero unless a backend's
+        audio device and capture device wake up at noticeably different speeds,
+        in which case the wav has to be lined up with the first frame before the
+        two are muxed together.
         """
         return 0.0
 
@@ -341,14 +342,19 @@ class CaptureBackend(ABC):
         if audio is None or not audio.exists() or audio.stat().st_size == 0:
             return video
         merged = self.workdir / f"mux{index}.mkv"
-        # -ss on the wav rather than a negative -itsoffset: seeking a PCM file
-        # is exact, while negative timestamps are the muxer's to interpret.
+        # A wav older than the first frame has its head seeked past - seeking a
+        # PCM file is exact. One that starts after the first frame is pushed
+        # back by real silence instead of a timestamp shift, because the parts
+        # are concatenated with -c copy afterwards and samples say what a gap in
+        # the timestamps only implies.
         lead = self.audio_lead(video, audio)
-        head = ["-ss", f"{lead:.3f}"] if lead else []
+        head = ["-ss", f"{lead:.3f}"] if lead > 0 else []
         offset = ["-itsoffset", str(self.audio_offset)] if self.audio_offset else []
         args = ["-i", str(video), *head, *offset, "-i", str(audio)]
-        # The side recording is always system audio, so it carries audio_gain.
-        level = ",".join(self.side_audio_filters()) or None
+        filters = list(self.side_audio_filters())
+        if lead < 0:
+            filters.insert(0, f"adelay=delays={-lead * 1000:.0f}ms:all=1")
+        level = ",".join(filters) or None
         if self.audio_inputs():
             # The segment already carries a track (a microphone, say), so the
             # side recording has to be mixed with it rather than replace it.

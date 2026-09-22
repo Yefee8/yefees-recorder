@@ -7,6 +7,7 @@ pin the behaviour the stdlib replacement has to keep.
 """
 
 import io
+import os
 import sys
 import time
 
@@ -20,6 +21,67 @@ def test_read_key_honours_its_timeout_when_nothing_is_typed():
     with keys.raw_mode():
         assert keys.read_key(0.3) is None
     assert time.monotonic() - start >= 0.25, "returning early would busy-spin the wait loop"
+
+
+def test_read_key_honours_its_timeout_when_the_input_has_ended(monkeypatch):
+    """A terminal that goes away leaves stdin readable and empty for good, so
+    without this the wait loop spins a core - measured at 380,000 calls a second
+    against the five the timeout allows."""
+    if keys.WINDOWS:
+        pytest.skip("the Windows console has no end of input to reach")
+
+    class Ended:
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            return self._read
+
+        def read(self, count):
+            return ""
+
+    ended = Ended()
+    ended._read, writer = os.pipe()
+    os.close(writer)  # nothing will ever be written, and the reader is at EOF
+    monkeypatch.setattr(keys, "interactive", lambda: True)
+    monkeypatch.setattr(sys, "stdin", ended)
+    start = time.monotonic()
+    assert keys.read_key(0.3) is None
+    assert time.monotonic() - start >= 0.25
+    os.close(ended._read)
+
+
+@pytest.mark.skipif(keys.WINDOWS, reason="the Windows console has its own reader")
+def test_keys_decode_off_a_real_terminal():
+    """Every menu test replaces read_key, so nothing exercised the decoding.
+
+    A buffered read pulls the whole escape sequence out of the kernel and hands
+    back one character, leaving select blind to the rest: arrows came back as a
+    bare Esc and the leftovers surfaced as the next keypress, so the stream
+    stayed out of step for good.
+    """
+    import pty
+
+    master, slave = pty.openpty()
+    real_stdin = sys.stdin
+    sys.stdin = os.fdopen(slave, "r")
+    try:
+        with keys.raw_mode():
+            for written, expected in [
+                (b"\x1b[A", keys.UP), (b"\x1b[B", keys.DOWN),
+                (b"\x1b[D", keys.LEFT), (b"\x1b[C", keys.RIGHT),
+                (b"\r", keys.ENTER), (b"\x7f", keys.BACKSPACE),
+                (b"q", "q"), (b" ", " "),
+                ("\u00f6".encode(), "\u00f6"),   # one keypress, two bytes
+                (b"\x1b", keys.ESC),            # a bare Esc, not a sequence
+            ]:
+                os.write(master, written)
+                time.sleep(0.05)
+                assert keys.read_key(0.5) == expected, f"after writing {written!r}"
+    finally:
+        sys.stdin.close()
+        sys.stdin = real_stdin
+        os.close(master)
 
 
 class NoDescriptor:

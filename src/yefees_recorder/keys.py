@@ -13,6 +13,7 @@ keys that arrive as escape sequences.
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 import time
 
@@ -108,20 +109,52 @@ def _read_windows(timeout: float) -> str | None:
         time.sleep(POLL_SECONDS)
 
 
+def _read_char(descriptor: int) -> str:
+    """One character straight off the descriptor, multi-byte ones included.
+
+    `os.read` and not `sys.stdin.read`: the buffered stream pulls a whole chunk
+    out of the kernel and hands back one character, leaving the rest where
+    select cannot see it - which is what made every arrow key read as a bare
+    Esc and put the next keypress out of step behind it.
+    """
+    first = os.read(descriptor, 1)
+    if not first:
+        return ""
+    # A UTF-8 lead byte says how many continuations follow, and a terminal
+    # sends them in the same write, so they are already waiting.
+    lead = first[0]
+    expected = 4 if lead >= 0xF0 else 3 if lead >= 0xE0 else 2 if lead >= 0xC0 else 1
+    data = first
+    while len(data) < expected:
+        more = os.read(descriptor, expected - len(data))
+        if not more:
+            break
+        data += more
+    return data.decode("utf-8", "replace")
+
+
 def _read_posix(timeout: float) -> str | None:
-    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    descriptor = sys.stdin.fileno()
+    ready, _, _ = select.select([descriptor], [], [], timeout)
     if not ready:
         return None
-    char = sys.stdin.read(1)
+    char = _read_char(descriptor)
+    if not char:
+        # End of input: the terminal went away and nothing will ever arrive
+        # again, but select keeps reporting the descriptor ready. Waiting out
+        # the timeout is what stops that from becoming a busy spin - the very
+        # thing blessed was rejected for.
+        time.sleep(timeout)
+        return None
     if char != "\x1b":
         return _normalise(char)
     # Escape on its own, or the start of a sequence: a bare Esc has nothing
     # queued behind it, so a zero timeout tells the two apart.
-    if not select.select([sys.stdin], [], [], 0.05)[0]:
+    if not select.select([descriptor], [], [], 0.05)[0]:
         return ESC
-    if sys.stdin.read(1) != "[":
+    if _read_char(descriptor) != "[":
         return ESC
-    return _ANSI_ARROWS.get(sys.stdin.read(1), ESC)
+    return _ANSI_ARROWS.get(_read_char(descriptor), ESC)
 
 
 def read_key(timeout: float) -> str | None:

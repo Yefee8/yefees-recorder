@@ -358,16 +358,17 @@ class MacBackend(CaptureBackend):
         return []
 
     def audio_lead(self, video: Path, audio: Path) -> float:
-        """How far ahead of the first frame the wav starts.
+        """How far ahead of the first frame the wav starts, negative if behind.
 
-        avfoundation opens an audio device in a fraction of the 1.3s the screen
-        takes, and the recorder is started first, so the wav begins well before
-        the video does - measured at 0.74s, which is plainly audible. Both are
-        stopped within milliseconds of each other, so whatever length the wav
-        has over the video it has at the front. It is not a constant: it depends
-        on how fast each device happens to wake up.
+        Both are stopped within milliseconds of each other, so whatever length
+        one has over the other it has at the front. Which way it goes is not
+        fixed and neither is the size: opening the screen took 0.74s longer
+        than opening the audio device on a first segment, and the audio device
+        took 1.02s longer than the screen on the segment after a pause. Left
+        alone it accumulates, putting the sound a segment further out of step
+        with the picture at every pause.
         """
-        return max(segment_seconds(audio) - segment_seconds(video), 0.0)
+        return segment_seconds(audio) - segment_seconds(video)
 
     def make_audio_recorder(self):
         sources = self.audio_sources()
