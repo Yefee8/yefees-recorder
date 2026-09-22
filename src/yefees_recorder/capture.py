@@ -206,6 +206,24 @@ class CaptureBackend(ABC):
             args += ["-c:a", "aac"]
         return args + self.output_options() + [str(output)]
 
+    def audio_lead(self, video: Path, audio: Path) -> float:
+        """Seconds by which a side recording starts before the video does.
+
+        Zero unless a backend opens its audio device faster than its capture
+        device, in which case the head of the wav is older than the first frame
+        and has to come off before the two are muxed together.
+        """
+        return 0.0
+
+    def side_audio_filters(self) -> list[str]:
+        """Filters for a side recording as it is muxed back in.
+
+        On Windows the side recording is system audio and nothing else, so it
+        carries `audio_gain` here. A backend whose recorder already mixed its
+        devices at their own levels returns nothing instead.
+        """
+        return [f"volume={self.audio_gain}"] if self.audio_gain != 1.0 else []
+
     def make_audio_recorder(self):
         """A side recorder for audio ffmpeg cannot capture, or None.
 
@@ -323,10 +341,14 @@ class CaptureBackend(ABC):
         if audio is None or not audio.exists() or audio.stat().st_size == 0:
             return video
         merged = self.workdir / f"mux{index}.mkv"
+        # -ss on the wav rather than a negative -itsoffset: seeking a PCM file
+        # is exact, while negative timestamps are the muxer's to interpret.
+        lead = self.audio_lead(video, audio)
+        head = ["-ss", f"{lead:.3f}"] if lead else []
         offset = ["-itsoffset", str(self.audio_offset)] if self.audio_offset else []
-        args = ["-i", str(video), *offset, "-i", str(audio)]
+        args = ["-i", str(video), *head, *offset, "-i", str(audio)]
         # The side recording is always system audio, so it carries audio_gain.
-        level = f"volume={self.audio_gain}" if self.audio_gain != 1.0 else None
+        level = ",".join(self.side_audio_filters()) or None
         if self.audio_inputs():
             # The segment already carries a track (a microphone, say), so the
             # side recording has to be mixed with it rather than replace it.

@@ -19,7 +19,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .capture import AudioInput, CaptureBackend, Source
+from .capture import FFMPEG_BASE, AudioInput, CaptureBackend, Source
 
 # Virtual output devices that loop system audio back to an input.
 LOOPBACK_DEVICE_HINTS = ("blackhole", "soundflower", "loopback audio", "ishowu", "multi-output")
@@ -33,6 +33,12 @@ SCREEN_PIXEL_FORMAT = "uyvy422"
 # A resumed segment is never asked for nothing: a duration that is already used
 # up would otherwise leave a zero-length file for the concat to choke on.
 MINIMUM_SEGMENT = 0.1
+
+# avfoundation hands over audio with honest timestamps but missing samples, so
+# the surviving ones have to be put back where they belong instead of being run
+# together. Measured on a 6.4s capture: 4.80s of audio without this, 5.98s with
+# it, and a beep train 1.000s apart that came out 0.75s apart lands at 1.000s.
+AUDIO_GAP_FILLER = "aresample=async=1"
 
 PERMISSION_HELP = (
     "Screen Recording permission has not been granted, so macOS would hand "
@@ -160,6 +166,100 @@ def request_screen_recording() -> bool:
         return False
 
 
+class AvfAudioRecorder:
+    """Records macOS audio to a wav, in an ffmpeg process of its own.
+
+    Two avfoundation inputs cannot share a process. Measured against a beep a
+    second: captured on its own the audio keeps all eight beeps and their exact
+    spacing, but put the screen in the same ffmpeg and two ragged fragments come
+    back - the capture session starves. Two *audio* inputs share a process
+    perfectly well, so the split is one process for what is seen and one for
+    everything that is heard, and the wav is muxed back in on stop.
+    """
+
+    def __init__(self, inputs: list[AudioInput]) -> None:
+        self.inputs = inputs
+        self._proc: subprocess.Popen | None = None
+        self._target: Path | None = None
+        self._parts: list[Path] = []
+
+    def parts_for(self, path: Path) -> list[Path]:
+        """Where each device is recorded before they are mixed together."""
+        return [path.with_name(f"{path.stem}-{number}.wav")
+                for number in range(len(self.inputs))]
+
+    def command(self, parts: list[Path]) -> list[str]:
+        """The command recording each device to a file of its own.
+
+        Every device gets its own output rather than being mixed on the way in.
+        amix cannot keep up with these devices: measured against a beep a
+        second, every beep arrives whole when each is written out on its own,
+        and comes back as 50 ms fragments with amix between them. Mixing the
+        finished files afterwards costs a fraction of a second and keeps them.
+        """
+        args = list(FFMPEG_BASE)
+        for one in self.inputs:
+            args += one.args
+        for number, (one, part) in enumerate(zip(self.inputs, parts)):
+            steps = [AUDIO_GAP_FILLER]
+            if one.gain != 1.0:
+                steps.append(f"volume={one.gain}")
+            args += ["-map", f"{number}:a", "-af", ",".join(steps),
+                     "-c:a", "pcm_s16le", str(part)]
+        return args
+
+    def mix_command(self, parts: list[Path], path: Path) -> list[str]:
+        """The command folding the finished per-device files into one."""
+        args = list(FFMPEG_BASE)
+        for part in parts:
+            args += ["-i", str(part)]
+        taps = "".join(f"[{number}:a]" for number in range(len(parts)))
+        # normalize=0 for the reason it is needed everywhere else: amix scales
+        # every input by 1/n unless told not to, so switching the microphone on
+        # would quieten the system audio.
+        return args + [
+            "-filter_complex",
+            f"{taps}amix=inputs={len(parts)}:duration=longest:normalize=0[out]",
+            "-map", "[out]", "-c:a", "pcm_s16le", str(path),
+        ]
+
+    def start(self, path: Path) -> None:
+        self._target = Path(path)
+        self._parts = self.parts_for(self._target)
+        self._proc = subprocess.Popen(self.command(self._parts), stdin=subprocess.PIPE)
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.stdin.write(b"q")  # ffmpeg finalizes the wavs on "q"
+                self._proc.stdin.flush()
+                self._proc.wait(timeout=15)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                self._proc.kill()
+                self._proc.wait()
+            finally:
+                self._proc = None
+        self._combine()
+
+    def _combine(self) -> None:
+        """Leave one wav where the caller asked for it, whatever was recorded.
+
+        A device that produced nothing is dropped rather than silencing the
+        others, and no recording at all leaves no file, which the mux reads as
+        "video only".
+        """
+        if self._target is None:
+            return
+        usable = [p for p in self._parts if p.exists() and p.stat().st_size > 0]
+        self._parts = []
+        if not usable:
+            return
+        if len(usable) == 1:
+            usable[0].replace(self._target)
+            return
+        subprocess.run(self.mix_command(usable, self._target), capture_output=True)
+
+
 class MacBackend(CaptureBackend):
     # ffmpeg counts -t from the first frame it captures, and avfoundation takes
     # 1.3s to hand that over - a duration timed from launch loses every one of
@@ -248,8 +348,37 @@ class MacBackend(CaptureBackend):
             )
 
     def audio_inputs(self) -> list[AudioInput]:
-        # Separate avfoundation inputs rather than the combined "screen:audio"
-        # form, which drifts between the streams.
+        # Nothing is recorded alongside the screen: a second avfoundation input
+        # in that process starves the capture session. See AvfAudioRecorder.
+        return []
+
+    def side_audio_filters(self) -> list[str]:
+        # The recorder already mixed its devices at their own levels, so there
+        # is no gain left to apply to the wav.
+        return []
+
+    def audio_lead(self, video: Path, audio: Path) -> float:
+        """How far ahead of the first frame the wav starts.
+
+        avfoundation opens an audio device in a fraction of the 1.3s the screen
+        takes, and the recorder is started first, so the wav begins well before
+        the video does - measured at 0.74s, which is plainly audible. Both are
+        stopped within milliseconds of each other, so whatever length the wav
+        has over the video it has at the front. It is not a constant: it depends
+        on how fast each device happens to wake up.
+        """
+        return max(segment_seconds(audio) - segment_seconds(video), 0.0)
+
+    def make_audio_recorder(self):
+        sources = self.audio_sources()
+        return AvfAudioRecorder(sources) if sources else None
+
+    def audio_sources(self) -> list[AudioInput]:
+        """The avfoundation audio devices to record, system audio first.
+
+        Separate inputs rather than the combined "screen:audio" form, which
+        drifts between the streams.
+        """
         inputs = []
         if self.want_audio:
             if self.audio_device:

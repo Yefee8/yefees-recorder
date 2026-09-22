@@ -90,21 +90,33 @@ def test_no_loopback_device_means_no_camera_or_mic_is_used():
     assert find_screen_device({0: "FaceTime HD Camera"}) is None
 
 
-def test_records_screen_and_loopback(listed, monkeypatch, tmp_path):
+def test_the_screen_is_captured_on_its_own(listed, monkeypatch, tmp_path):
+    """Measured: a second avfoundation input in this process starves the capture
+    session, and eight beeps a second apart come back as two fragments."""
     monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
     command = MacBackend(tmp_path / "o.mp4", fps=30).capture_command(tmp_path / "s.mkv")
     assert "avfoundation" in command
     assert "1:none" in command   # screen device, no audio on the video input
-    assert "none:1" in command   # loopback as a separate input
-    assert "aac" in command
+    assert not any(argument.startswith("none:") for argument in command)
+    assert "-c:a" not in command
+
+
+def test_the_loopback_is_recorded_beside_it(listed, monkeypatch, tmp_path):
+    monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
+    recorder = MacBackend(tmp_path / "o.mp4").make_audio_recorder()
+    command = recorder.command(recorder.parts_for(tmp_path / "s.wav"))
+    assert "none:1" in command   # the loopback of the sample, on its own
+    # avfoundation delivers honest timestamps with samples missing between them,
+    # so what did arrive has to be put back where it belongs.
+    assert "aresample=async=1" in command
 
 
 def test_missing_loopback_still_records_video(listed, monkeypatch, tmp_path):
     monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
     monkeypatch.setattr(macos, "find_loopback_device", lambda devices: None)
     backend = MacBackend(tmp_path / "o.mp4")
-    command = backend.capture_command(tmp_path / "s.mkv")
-    assert "none:" not in " ".join(command)
+    assert backend.make_audio_recorder() is None
+    assert backend.capture_command(tmp_path / "s.mkv")
     assert "blackhole" in backend.audio_error.lower()
 
 
@@ -200,20 +212,65 @@ def test_region_becomes_a_crop_filter(listed, monkeypatch, tmp_path):
 
 def test_named_audio_device_is_selected(listed, tmp_path):
     backend = MacBackend(tmp_path / "o.mp4", audio_device="built-in")
-    assert backend.audio_inputs()[0].args[-1] == "none:0"
+    assert backend.audio_sources()[0].args[-1] == "none:0"
     with pytest.raises(RuntimeError, match="No audio device matching"):
-        MacBackend(tmp_path / "o.mp4", audio_device="nonexistent").audio_inputs()
+        MacBackend(tmp_path / "o.mp4", audio_device="nonexistent").audio_sources()
 
 
 def test_mic_picks_the_non_loopback_device(listed, tmp_path):
     """BlackHole is at audio 1 and the built-in mic at 0; they must not swap."""
     backend = MacBackend(tmp_path / "o.mp4", mic=True)
-    inputs = backend.audio_inputs()
-    assert [i.args[-1] for i in inputs] == ["none:1", "none:0"]
+    assert [i.args[-1] for i in backend.audio_sources()] == ["none:1", "none:0"]
+
+
+def test_each_device_is_recorded_on_its_own(listed, tmp_path):
+    """Mixing on the way in loses most of the audio: measured against a beep a
+    second, amix between the devices and the file turned whole beeps into 50 ms
+    fragments, while a file per device kept every one of them."""
+    recorder = MacBackend(tmp_path / "o.mp4", mic=True, mic_gain=2.0).make_audio_recorder()
+    parts = recorder.parts_for(tmp_path / "s.wav")
+    assert len(parts) == 2 and len(set(parts)) == 2
+    command = recorder.command(parts)
+    assert "amix" not in " ".join(command)
+    assert command.count("-af") == 2
+    assert "aresample=async=1,volume=2.0" in command   # the microphone, lifted
+    # each device drops its own buffers, so each gets its own gap filler
+    assert " ".join(command).count("aresample=async=1") == 2
+
+
+def test_the_finished_files_are_mixed_without_normalising(listed, tmp_path):
+    """amix scales every input by 1/n unless told not to, so switching the
+    microphone on would otherwise quieten the system audio."""
+    recorder = MacBackend(tmp_path / "o.mp4", mic=True).make_audio_recorder()
+    parts = recorder.parts_for(tmp_path / "s.wav")
+    graph = recorder.mix_command(parts, tmp_path / "s.wav")
+    assert "amix=inputs=2" in graph[graph.index("-filter_complex") + 1]
+    assert "normalize=0" in graph[graph.index("-filter_complex") + 1]
+
+
+def test_one_device_needs_no_mixing_pass(listed, monkeypatch, tmp_path):
+    """The common case is system audio alone; renaming beats re-encoding it."""
+    recorder = MacBackend(tmp_path / "o.mp4").make_audio_recorder()
+    target = tmp_path / "s.wav"
+    part = recorder.parts_for(target)[0]
+    recorder._target, recorder._parts = target, [part]
+    part.write_bytes(b"not really a wav, but not empty either")
+    recorder._combine()
+    assert target.exists() and not part.exists()
+
+
+def test_the_wav_is_not_given_the_gain_a_second_time(listed, tmp_path):
+    """The recorder already mixed both devices at their own levels, so the mux
+    must not put audio_gain over the microphone as well."""
+    assert MacBackend(tmp_path / "o.mp4", audio_gain=3.0).side_audio_filters() == []
 
 
 def test_missing_loopback_still_records_the_mic(listed, monkeypatch, tmp_path):
     monkeypatch.setattr(macos, "find_loopback_device", lambda devices: None)
     backend = MacBackend(tmp_path / "o.mp4", mic=True)
-    assert [i.args[-1] for i in backend.audio_inputs()] == ["none:0"]
+    assert [i.args[-1] for i in backend.audio_sources()] == ["none:0"]
     assert backend.audio_error
+    # The one device left still gets its gap filler.
+    recorder = backend.make_audio_recorder()
+    command = recorder.command(recorder.parts_for(tmp_path / "s.wav"))
+    assert command[command.index("-af") + 1] == "aresample=async=1"
