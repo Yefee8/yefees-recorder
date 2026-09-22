@@ -52,6 +52,14 @@ def test_pause_skips_the_gap(tmp_path):
     assert duration_of(out) < 4.5  # ~3s of capture, not ~5s of wall clock
 
 
+def test_a_plain_backend_does_not_limit_its_own_duration(tmp_path):
+    """Only a backend whose device is slow to wake up needs ffmpeg to count; for
+    the rest the caller still times the recording, exactly as before."""
+    backend = FakeBackend(tmp_path / "out.mp4", duration=5, audio=False)
+    assert not backend.limits_duration
+    assert "-t" not in backend.capture_command(tmp_path / "s.mkv")
+
+
 def test_start_twice_is_an_error(tmp_path):
     backend = FakeBackend(tmp_path / "out.mp4", fps=10, audio=False)
     backend.start()

@@ -19,7 +19,7 @@ from rich.table import Table
 
 from . import config as user_config
 from . import editor, keys, menu, shutdown
-from .capture import get_backend, list_sources, parse_region
+from .capture import STARTUP_GRACE, get_backend, list_sources, parse_region
 
 app = typer.Typer(help="Cross-platform screen recorder built on mpv.", no_args_is_help=True)
 console = Console()
@@ -223,6 +223,7 @@ def record(
             quality=quality_name, display=display, window=window,
             region=area, audio_device=audio_device, mic=mic, mic_device=mic_device,
             audio_gain=audio_gain, mic_gain=mic_gain, app_audio=app_audio,
+            duration=duration,
         )
     except (NotImplementedError, ValueError) as exc:
         console.print(f"[red]{exc}[/]")
@@ -286,6 +287,8 @@ def _watch_for_keys(backend, deadline: float | None) -> None:
     """Handle pause and stop keys until one stops us, or the deadline passes."""
     paused = False
     while deadline is None or time.monotonic() < deadline:
+        if backend.capture_ended:
+            return  # it recorded its fill and stopped itself
         key = keys.read_key(0.2)
         if key in PAUSE_KEYS:
             paused = _toggle_pause(backend, paused)
@@ -309,6 +312,10 @@ def _run_until_stopped(backend, duration: float) -> None:
     so the recording still gets finalised.
     """
     deadline = time.monotonic() + duration if duration > 0 else None
+    if deadline is not None and backend.limits_duration:
+        # It counts the duration from its first captured frame, so it finishes
+        # later than this clock does; here the clock is only a backstop.
+        deadline += STARTUP_GRACE
     try:
         with keys.raw_mode():
             _watch_for_keys(backend, deadline)

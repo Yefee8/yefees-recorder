@@ -140,6 +140,40 @@ def test_the_capture_pixel_format_is_named(listed, monkeypatch, tmp_path):
     assert args.index("-pixel_format") < args.index("-i"), "it configures the input"
 
 
+def test_ffmpeg_is_asked_to_count_the_duration(listed, monkeypatch, tmp_path):
+    """avfoundation is 1.3s late with its first frame, and a duration timed from
+    launch loses all of it - 5 seconds asked for measured 4.0s of video."""
+    monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
+    command = MacBackend(tmp_path / "o.mp4", duration=5).capture_command(tmp_path / "s.mkv")
+    assert command[command.index("-t") + 1] == "5.000"
+    assert command.index("-t") == len(command) - 3, "an output option, not an input one"
+
+
+def test_no_duration_means_no_limit(listed, monkeypatch, tmp_path):
+    monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
+    assert "-t" not in MacBackend(tmp_path / "o.mp4").capture_command(tmp_path / "s.mkv")
+
+
+def test_a_resumed_segment_asks_for_what_is_left(listed, monkeypatch, tmp_path):
+    """-t restarts from zero every time, so handing it the whole duration again
+    after a pause would overrun the recording by however much came before."""
+    monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
+    monkeypatch.setattr(macos, "segment_seconds", lambda path: 3.5)
+    backend = MacBackend(tmp_path / "o.mp4", duration=10)
+    backend._segments.append((tmp_path / "seg0.mkv", None))
+    command = backend.capture_command(tmp_path / "seg1.mkv")
+    assert command[command.index("-t") + 1] == "6.500"
+
+
+def test_a_used_up_duration_still_asks_for_something(listed, monkeypatch, tmp_path):
+    """-t 0 would leave an empty segment for the concat to choke on."""
+    monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
+    monkeypatch.setattr(macos, "segment_seconds", lambda path: 99.0)
+    backend = MacBackend(tmp_path / "o.mp4", duration=10)
+    backend._segments.append((tmp_path / "seg0.mkv", None))
+    assert float(backend.capture_command(tmp_path / "seg1.mkv")[-2]) > 0
+
+
 def test_display_maps_past_the_camera_to_the_right_screen(listed, monkeypatch, tmp_path):
     monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
     # video devices are camera=0, screens at 1 and 2, so --display 1 is device 2

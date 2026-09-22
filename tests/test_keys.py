@@ -53,6 +53,11 @@ def test_raw_mode_restores_itself_even_if_the_body_raises():
 
 
 class FakeBackend:
+    # Part of the backend contract the wait loop reads: whether the recorder
+    # enforces the duration itself, and whether it has stopped on its own.
+    limits_duration = False
+    capture_ended = False
+
     def __init__(self):
         self.calls = []
 
@@ -119,6 +124,25 @@ def test_duration_ends_the_loop_without_any_keypress(monkeypatch, backend):
     start = time.monotonic()
     cli._run_until_stopped(backend, 0.4)
     assert 0.3 < time.monotonic() - start < 2.0
+
+
+def test_a_recorder_that_stops_itself_ends_the_loop(monkeypatch, backend):
+    """A backend counting the duration itself finishes later than any clock here
+    would, so the loop has to watch for it rather than time it."""
+    backend.capture_ended = True
+    monkeypatch.setattr(keys, "read_key", lambda timeout: pytest.fail("should not wait for a key"))
+    cli._run_until_stopped(backend, 30)  # must return at once, not in 30s
+
+
+def test_a_self_timing_recorder_is_given_grace_past_its_duration(monkeypatch, backend):
+    """Stopping it on the clock here would cut off exactly the startup time the
+    -t is there to recover."""
+    backend.limits_duration = True
+    deadlines = []
+    monkeypatch.setattr(cli, "_watch_for_keys", lambda b, deadline: deadlines.append(deadline))
+    start = time.monotonic()
+    cli._run_until_stopped(backend, 5)
+    assert deadlines[0] - start > 5 + cli.STARTUP_GRACE - 1
 
 
 def test_ctrl_c_stops_cleanly(monkeypatch, backend):

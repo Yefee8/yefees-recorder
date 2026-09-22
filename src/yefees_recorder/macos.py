@@ -30,6 +30,10 @@ DEVICE_LINE = re.compile(r"\[(\d+)\]\s+(.+?)\s*$")
 # for the encoder; asking the device for yuv420p directly is what it refuses.
 SCREEN_PIXEL_FORMAT = "uyvy422"
 
+# A resumed segment is never asked for nothing: a duration that is already used
+# up would otherwise leave a zero-length file for the concat to choke on.
+MINIMUM_SEGMENT = 0.1
+
 PERMISSION_HELP = (
     "Screen Recording permission has not been granted, so macOS would hand "
     "ffmpeg no frames at all and the recording would hang instead of failing.\n"
@@ -108,6 +112,20 @@ def list_sources() -> list[Source]:
     return sources
 
 
+def segment_seconds(path: Path) -> float:
+    """Seconds of video in a finished segment, or 0 when it cannot be read."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        return float(probe.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
 def find_microphone(audio_devices: dict[int, str]) -> int | None:
     """The first device that is not a loopback, i.e. a real input."""
     for index, name in sorted(audio_devices.items()):
@@ -143,6 +161,13 @@ def request_screen_recording() -> bool:
 
 
 class MacBackend(CaptureBackend):
+    # ffmpeg counts -t from the first frame it captures, and avfoundation takes
+    # 1.3s to hand that over - a duration timed from launch loses every one of
+    # those seconds, measured as 4.0s of video for a 5s recording. Nothing
+    # outside ffmpeg can see when the device woke up, so ffmpeg is asked to do
+    # the counting.
+    limits_duration = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._devices = None
@@ -152,6 +177,14 @@ class MacBackend(CaptureBackend):
         if self._devices is None:
             self._devices = list_avfoundation_devices()
         return self._devices
+
+    def output_options(self) -> list[str]:
+        if not self.duration:
+            return []
+        # After a pause the next segment asks for what is left of the duration;
+        # handing it the whole of it again would overrun the recording.
+        done = sum(segment_seconds(video) for video, _ in self._segments)
+        return ["-t", f"{max(self.duration - done, MINIMUM_SEGMENT):.3f}"]
 
     def video_filters(self) -> list[str]:
         # avfoundation grabs a whole screen, so a region has to be cropped after.

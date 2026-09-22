@@ -37,6 +37,11 @@ QUALITY_PRESETS = {
 
 REGION = re.compile(r"^\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*x\s*(\d+)\s*$")
 
+# How long past its duration to let a self-timing recorder finish before giving
+# up on it. It stops later than a clock started at launch would, because it
+# counts from its first captured frame - which is the entire point of it.
+STARTUP_GRACE = 10.0
+
 
 class AudioInput(NamedTuple):
     """One ffmpeg audio input, with the gain to apply before mixing.
@@ -97,6 +102,7 @@ class CaptureBackend(ABC):
         audio_gain: float = 1.0,
         mic_gain: float = 1.0,
         app_audio: str | None = None,
+        duration: float = 0.0,
     ) -> None:
         self.output = Path(output)
         self.fps = fps
@@ -119,6 +125,10 @@ class CaptureBackend(ABC):
         self.audio_gain = audio_gain
         self.mic_gain = mic_gain
         self.app_audio = app_audio
+        # Seconds to capture, 0 meaning "until stopped". Only a backend that
+        # sets `limits_duration` acts on it; for the rest the caller times the
+        # recording from the outside, as it always has.
+        self.duration = duration
         # ponytail: fixed A/V nudge in seconds; per-machine calibration knob.
         # Raise it if audio runs early, lower it if audio runs late.
         self.audio_offset = audio_offset
@@ -132,6 +142,12 @@ class CaptureBackend(ABC):
     # How to ask the capture process to finish. None means ffmpeg: write "q" to
     # its stdin. Anything else is a signal number to send instead.
     stop_signal = None
+
+    # Whether the recorder enforces `duration` itself. A device that is slow to
+    # wake up makes a duration timed from launch come out short, so a backend
+    # that can count from its first captured frame says so here and the caller
+    # waits for it to finish instead of stopping it on a clock.
+    limits_duration = False
 
     @abstractmethod
     def video_input_args(self) -> list[str]:
@@ -149,6 +165,10 @@ class CaptureBackend(ABC):
     def video_filters(self) -> list[str]:
         """Filters applied to the captured video, innermost first."""
         return [EVEN_DIMS]
+
+    def output_options(self) -> list[str]:
+        """Extra ffmpeg options for the segment, just before its file name."""
+        return []
 
     def capture_command(self, output: Path) -> list[str]:
         """The full command recording one segment to `output`."""
@@ -184,7 +204,7 @@ class CaptureBackend(ABC):
                  "-pix_fmt", "yuv420p"]
         if inputs:
             args += ["-c:a", "aac"]
-        return args + [str(output)]
+        return args + self.output_options() + [str(output)]
 
     def make_audio_recorder(self):
         """A side recorder for audio ffmpeg cannot capture, or None.
@@ -197,6 +217,11 @@ class CaptureBackend(ABC):
     @property
     def recording(self) -> bool:
         return self._proc is not None
+
+    @property
+    def capture_ended(self) -> bool:
+        """Whether the capture process stopped on its own rather than paused."""
+        return self._proc is not None and self._proc.poll() is not None
 
     def setup(self) -> None:
         """Prepare anything the capture needs, before the first segment.
