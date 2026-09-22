@@ -35,6 +35,7 @@ DEFAULTS: dict[str, Any] = {
     "mic_device": None,
     "mic_gain": 1.0,
     "app_audio": None,
+    "accent": None,
     "display": None,
     "window": None,
     "region": None,
@@ -54,6 +55,7 @@ TYPES: dict[str, Any] = {
     "mic_device": str,
     "mic_gain": (int, float),
     "app_audio": str,
+    "accent": str,
     "display": int,
     "window": str,
     "region": str,
@@ -86,6 +88,9 @@ TEMPLATE = """\
 
 # Record one application instead of the whole output device (Linux only).
 # app_audio = "Firefox"
+
+# The colour the menus are built around: a hex value or a colour name.
+# accent = "#5A4FCF"
 
 # display = 0   # record one monitor by default
 # window = "Firefox"

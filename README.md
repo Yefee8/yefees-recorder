@@ -153,8 +153,19 @@ The bar turns yellow past +6 dB and red past +14 dB, where clipping starts.
 Levels are stored as the multiplier ffmpeg needs, so `mic_gain = 2.0` in the
 file and `+6 dB` in the menu are the same thing.
 
-Devices are scanned once when a page first needs them; pick **Rescan** in a
-device list if you plug something in while the menu is open.
+Move with the arrow keys, **Enter** to choose, **Left** or **Backspace** to go
+back. Devices are scanned once when a page first needs them; pick **Rescan** in
+a device list if you plug something in while the menu is open.
+
+The menus are built around one colour, indigo by default. Change it under
+**Menu colour**, or set it in the config:
+
+```toml
+accent = "#5A4FCF"    # a hex value, or a name like "blue_violet"
+```
+
+The text colour on a highlighted row is worked out from that colour's
+brightness, so a pale accent gets black text and a dark one gets white.
 
 Nothing is written until you choose Save, only the settings you changed are
 written, and your comments survive.

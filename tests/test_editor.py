@@ -333,3 +333,70 @@ class TestSourceScanning:
         picked = editor._pick_device(screen, sources, "mic", "Microphone", None)
         assert picked == "Headset Mic"
         assert len(calls) == 2, "rescan must actually look again"
+
+
+class TestBackspaceGoesBack:
+    def test_backspace_leaves_a_menu(self, monkeypatch):
+        press(monkeypatch, keys.BACKSPACE)
+        assert menu.choose("t", [Item("a", "a")], console=console) is CANCELLED
+
+    def test_backspace_leaves_a_slider(self, monkeypatch):
+        press(monkeypatch, keys.RIGHT, keys.BACKSPACE)
+        with menu.Screen(console) as screen:
+            value = screen.slider("v", value=1.0, minimum=0.0, maximum=8.0, step=0.5)
+        assert value is CANCELLED
+
+    def test_backspace_still_deletes_in_a_text_field(self, monkeypatch):
+        """Going back must not steal the one key a text field needs most."""
+        press(monkeypatch, "6", "0", keys.BACKSPACE, "5", keys.ENTER)
+        assert menu.ask_text("n", console=console) == "65"
+
+
+class TestTheme:
+    @pytest.mark.parametrize(
+        "colour, expected",
+        [("#000000", "white"), ("#5A4FCF", "white"), ("#EEEEEE", "black"), ("#FFFF00", "black")],
+    )
+    def test_text_colour_follows_the_backgrounds_brightness(self, colour, expected):
+        """Choosing by eye is how a highlight ends up unreadable."""
+        assert menu.readable_on(colour) == expected
+
+    def test_an_unparseable_accent_falls_back(self):
+        menu.apply_theme("banana")
+        assert menu.THEME["accent"] == menu.DEFAULT_ACCENT
+        menu.apply_theme(None)
+
+    def test_named_colours_work_as_well_as_hex(self):
+        assert menu.is_colour("blue_violet")
+        assert menu.is_colour("#5A4FCF")
+        assert not menu.is_colour("banana")
+
+    def test_the_selection_always_states_both_colours(self):
+        for _name, colour in menu.ACCENT_CHOICES:
+            menu.apply_theme(colour)
+            assert menu.THEME["selected"].endswith(f"on {colour}")
+            assert menu.THEME["selected"].split()[1] in ("black", "white")
+        menu.apply_theme(None)
+
+    def test_the_accent_is_read_from_the_config(self, config_file, interactive, monkeypatch):
+        config_file.write_text('accent = "#2F6FED"\n', encoding="utf-8")
+        Script("quit").install(monkeypatch)
+        editor.run(console)
+        assert menu.THEME["accent"] == "#2F6FED"
+        menu.apply_theme(None)
+
+    def test_choosing_a_colour_applies_it_before_saving(
+        self, config_file, interactive, monkeypatch
+    ):
+        Script("appearance", "#2E8B57", "save").install(monkeypatch)
+        assert editor.run(console) is True
+        assert menu.THEME["accent"] == "#2E8B57"
+        assert config.load().values == {"accent": "#2E8B57"}
+        menu.apply_theme(None)
+
+    def test_a_previewed_colour_is_undone_when_quitting(
+        self, config_file, interactive, monkeypatch
+    ):
+        Script("appearance", "#B4690E", "quit", True).install(monkeypatch)
+        assert editor.run(console) is False
+        assert menu.THEME["accent"] == menu.DEFAULT_ACCENT, "preview should not stick"

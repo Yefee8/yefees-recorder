@@ -16,6 +16,7 @@ import math
 import sys
 from typing import Any, Callable, NamedTuple
 
+from rich.color import Color
 from rich.console import Console, Group
 from rich.live import Live
 from rich.text import Text
@@ -46,39 +47,79 @@ BAR_FULL = "█" if FANCY else "#"
 BAR_EMPTY = "░" if FANCY else "-"
 
 HINT_MENU = (
-    "↑↓ move   ⏎ select   ← back" if FANCY
-    else "up/down move   Enter select   Left back"
+    "↑↓ move   ⏎ select   ←/⌫ back" if FANCY
+    else "up/down move   Enter select   Left/Backspace back"
 )
 HINT_TEXT = (
     "⏎ accept   ⌫ delete   Esc cancel   (empty = automatic)" if FANCY
     else "Enter accept   Backspace delete   Esc cancel   (empty = automatic)"
 )
 HINT_SLIDER = (
-    "←→ adjust   ↑↓ bigger steps   ⏎ accept   Esc cancel" if FANCY
-    else "left/right adjust   up/down bigger steps   Enter accept   Esc cancel"
+    "←→ adjust   ↑↓ bigger steps   ⏎ accept   ⌫ back" if FANCY
+    else "left/right adjust   up/down bigger steps   Enter accept   Backspace back"
 )
 
-# One place to change how the whole interface looks. Everything here has to
-# stay legible on both a dark and a light terminal, which rules out mid-greys
-# for anything that matters and pale text on a pale background.
+# The one colour the interface is built around. Anything rich can parse works:
+# a hex value like "#5A4FCF" or a colour name like "blue_violet".
+DEFAULT_ACCENT = "#5A4FCF"   # indigo
+
+# Named alternatives offered in the settings menu.
+ACCENT_CHOICES = (
+    ("Indigo", DEFAULT_ACCENT),
+    ("Blue", "#2F6FED"),
+    ("Teal", "#0E8A8A"),
+    ("Violet", "#8B5CF6"),
+    ("Green", "#2E8B57"),
+    ("Amber", "#B4690E"),
+)
+
+
+def _rgb(colour: str) -> tuple[int, int, int] | None:
+    try:
+        red, green, blue = Color.parse(colour).get_truecolor()
+    except Exception:
+        return None
+    return red, green, blue
+
+
+def is_colour(text: str) -> bool:
+    """Whether rich can make sense of this as a colour."""
+    return bool(text) and _rgb(text) is not None
+
+
+def readable_on(background: str) -> str:
+    """Black or white, whichever can actually be read on `background`.
+
+    Picking one by eye is how a highlight ends up as white text on a pale
+    block. Relative luminance decides it instead, so any accent stays legible.
+    """
+    parsed = _rgb(background)
+    if parsed is None:
+        return "white"
+    red, green, blue = (channel / 255 for channel in parsed)
+    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    return "black" if luminance > 0.55 else "white"
+
+
+def _lighten(colour: str, amount: float = 0.45) -> str:
+    """A paler version, for use as text where the accent itself would be dark."""
+    parsed = _rgb(colour)
+    if parsed is None:
+        return colour
+    channels = (round(channel + (255 - channel) * amount) for channel in parsed)
+    return "#{:02x}{:02x}{:02x}".format(*channels)
+
+
+# How the whole interface looks, rebuilt whenever the accent changes.
+# Everything here has to stay legible on both a dark and a light terminal.
 #
 # Ordinary text deliberately carries no colour at all: the terminal's own
 # foreground is the one colour guaranteed to contrast with its background.
-STYLE_TITLE = "bold cyan"
-STYLE_CURSOR = "bold cyan"
-STYLE_SELECTED = "bold black on bright_cyan"   # whole row, so the block reads as one
-STYLE_LABEL = ""                               # terminal default: maximum contrast
-STYLE_DISABLED = "bright_black"
-STYLE_REASON = "yellow"
-STYLE_HINT = "bright_black"
-STYLE_ERROR = "bold red"
-STYLE_VALUE = "bold"
-STYLE_SCALE = "bright_black"
-STYLE_FIELD = "bold black on bright_cyan"
+THEME: dict[str, str] = {}
 
-# What a detail column means, rather than what colour it is. These are the
-# basic ANSI colours on purpose: a terminal theme adjusts them to stay readable
-# against its own background, which 256-colour greys do not.
+# What a detail column means, rather than what colour it is. The basic ANSI
+# colours are used on purpose: a terminal theme adjusts them to stay readable
+# against its own background, which fixed 256-colour greys do not.
 TONES = {
     "muted": "bright_black",
     "good": "green",
@@ -86,9 +127,37 @@ TONES = {
     "info": "cyan",
     "loud": "bold red",
 }
+TONES_SELECTED: dict[str, str] = {}
 
-# Detail colours vanish against the selection, so a selected row keeps one style.
-TONES_SELECTED = dict.fromkeys(TONES, "black on bright_cyan")
+
+def apply_theme(accent: str | None = None) -> None:
+    """Rebuild the palette around `accent`. Unparseable colours fall back."""
+    accent = accent or DEFAULT_ACCENT
+    if _rgb(accent) is None:
+        accent = DEFAULT_ACCENT
+    on_accent = readable_on(accent)
+    text_accent = _lighten(accent)
+
+    THEME.update({
+        "accent": accent,
+        "title": f"bold {text_accent}",
+        "cursor": f"bold {text_accent}",
+        "selected": f"bold {on_accent} on {accent}",
+        "label": "",                    # terminal default: maximum contrast
+        "disabled": "bright_black",
+        "reason": "yellow",
+        "hint": "bright_black",
+        "error": "bold red",
+        "value": "bold",
+        "scale": "bright_black",
+        "field": f"bold {on_accent} on {accent}",
+    })
+    # Detail colours vanish against the selection, so a selected row keeps one.
+    TONES_SELECTED.clear()
+    TONES_SELECTED.update(dict.fromkeys(TONES, f"{on_accent} on {accent}"))
+
+
+apply_theme()
 
 
 def safe(text: str) -> str:
@@ -148,11 +217,11 @@ class Done(NamedTuple):
 
 # -------------------------------------------------------------------- views
 def _heading(title: str) -> list[Text]:
-    return [Text(safe(title), style=STYLE_TITLE), Text("")] if title else []
+    return [Text(safe(title), style=THEME["title"]), Text("")] if title else []
 
 
 def _footer(hint: str) -> list[Text]:
-    return [Text(""), Text(safe(hint), style=STYLE_HINT)]
+    return [Text(""), Text(safe(hint), style=THEME["hint"])]
 
 
 def _item_row(item: Item, selected: bool) -> Text:
@@ -162,16 +231,16 @@ def _item_row(item: Item, selected: bool) -> Text:
     cursor, label and detail all share the selection style.
     """
     palette = TONES_SELECTED if selected else TONES
-    row = Text(style=STYLE_SELECTED if selected else "")
+    row = Text(style=THEME["selected"] if selected else "")
     row.append(f"  {CURSOR} " if selected else "    ",
-               style="" if selected else STYLE_CURSOR)
+               style="" if selected else THEME["cursor"])
 
     if not item.enabled:
-        row.append(safe(item.label), style="" if selected else STYLE_DISABLED)
+        row.append(safe(item.label), style="" if selected else THEME["disabled"])
         detail = item.reason
-        tone = "" if selected else STYLE_REASON
+        tone = "" if selected else THEME["reason"]
     else:
-        row.append(safe(item.label), style="bold" if selected else STYLE_LABEL)
+        row.append(safe(item.label), style="bold" if selected else THEME["label"])
         detail = item.detail
         tone = palette.get(item.tone, palette["muted"])
 
@@ -188,10 +257,10 @@ def _menu_view(title: str, items: list[Item], cursor: int, hint: str) -> Group:
 
 def _text_view(prompt: str, typed: str, error: str) -> Group:
     field = Text()
-    field.append(safe("  " + prompt + ": "), style=STYLE_TITLE)
-    field.append(safe(typed) or " ", style=STYLE_FIELD)
-    problem = [Text(safe("  " + error), style=STYLE_ERROR), Text("")] if error else []
-    return Group(field, Text(""), *problem, Text("  " + HINT_TEXT, style=STYLE_HINT))
+    field.append(safe("  " + prompt + ": "), style=THEME["title"])
+    field.append(safe(typed) or " ", style=THEME["field"])
+    problem = [Text(safe("  " + error), style=THEME["error"]), Text("")] if error else []
+    return Group(field, Text(""), *problem, Text("  " + HINT_TEXT, style=THEME["hint"]))
 
 
 def _bar_style(state: "SliderState") -> str:
@@ -220,14 +289,14 @@ def _slider_view(state: "SliderState", width: int = 28) -> Group:
 
     bar = Text("  ")
     bar.append(BAR_FULL * filled, style=_bar_style(state))
-    bar.append(BAR_EMPTY * (width - filled), style=STYLE_DISABLED)
-    bar.append(f"  {state.value:g}", style=STYLE_VALUE)
+    bar.append(BAR_EMPTY * (width - filled), style=THEME["disabled"])
+    bar.append(f"  {state.value:g}", style=THEME["value"])
     if state.describe:
         bar.append(f"   {state.describe(state.value)}", style=TONES["info"])
 
     ends = f"  {state.minimum:g}" + " " * max(1, width - 6) + f"{state.maximum:g}"
     hint = HINT_SLIDER + ("   t type a value" if state.allow_typing else "")
-    return Group(*_heading(state.title), bar, Text(ends, style=STYLE_SCALE), *_footer(hint))
+    return Group(*_heading(state.title), bar, Text(ends, style=THEME["scale"]), *_footer(hint))
 
 
 # ------------------------------------------------------------- page state
@@ -278,6 +347,11 @@ class SliderState:
 
 
 # ----------------------------------------------------------------- handlers
+# Ways to leave a page. Backspace is included because reaching for it to go
+# back is a reflex; the text field keeps it for deleting instead.
+BACK_KEYS = (keys.ESC, keys.BACKSPACE, "q", "Q")
+
+
 def _handle_menu(state: MenuState, key: str, on_left: bool) -> Done | None:
     if key == keys.UP:
         state.move(-1)
@@ -285,7 +359,7 @@ def _handle_menu(state: MenuState, key: str, on_left: bool) -> Done | None:
         state.move(1)
     elif key in (keys.ENTER, keys.RIGHT, " "):
         return Done(state.chosen)
-    elif key in (keys.ESC, "q", "Q") or (on_left and key == keys.LEFT):
+    elif key in BACK_KEYS or (on_left and key == keys.LEFT):
         return Done(CANCELLED)
     return None
 
@@ -311,7 +385,7 @@ def _handle_slider(state: SliderState, key: str, allow_typing: bool) -> Done | N
         return Done(state.value)
     elif allow_typing and key in ("t", "T"):
         return Done(TYPE_IT)
-    elif key in (keys.ESC, "q", "Q"):
+    elif key in BACK_KEYS:
         return Done(CANCELLED)
     return None
 
@@ -354,7 +428,7 @@ class Screen:
 
     def notice(self, message: str) -> None:
         """Say what is happening during something slow, so it is not a freeze."""
-        self._draw(Text(f"  {safe(message)}", style=STYLE_TITLE))
+        self._draw(Text(f"  {safe(message)}", style=THEME["title"]))
 
     def _run(self, view: Callable[[], Any], handle: Callable[[str], Done | None]) -> Any:
         """Read keys until a handler finishes, redrawing once per batch.

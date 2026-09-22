@@ -146,6 +146,7 @@ def record(
         raise typer.Exit(1)
 
     loaded = user_config.load()
+    menu.apply_theme(loaded.values.get("accent"))
     for complaint in loaded.warnings:
         console.print(f"[yellow]{complaint}[/]")
 

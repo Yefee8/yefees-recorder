@@ -288,6 +288,43 @@ def _audio_menu(screen: Screen, sources: Sources, values: dict) -> None:
         _edit_audio(screen, sources, values, chosen)
 
 
+# ---------------------------------------------------------------- appearance
+def _accent_items(current: str | None) -> list[Item]:
+    chosen = current or menu.DEFAULT_ACCENT
+    items = [
+        Item(name, colour, colour + ("   (in use)" if colour == chosen else ""),
+             tone="good" if colour == chosen else "info")
+        for name, colour in menu.ACCENT_CHOICES
+    ]
+    items.append(Item("Something else", "custom", "any hex value or colour name"))
+    return items
+
+
+def _check_colour(text: str) -> str | None:
+    return None if menu.is_colour(text) else "Not a colour rich understands."
+
+
+def _appearance_menu(screen: Screen, sources: Sources, values: dict) -> None:
+    """Pick the colour the menus are built around, applied as you choose it."""
+    while True:
+        chosen = screen.choose(
+            "Menu colour", _accent_items(values.get("accent")),
+            hint=menu.HINT_MENU + "   (the text colour is chosen to stay readable)",
+        )
+        if chosen is CANCELLED:
+            return
+        if chosen == "custom":
+            typed = screen.ask_text("Colour, e.g. #5A4FCF or blue_violet",
+                                    current=values.get("accent") or menu.DEFAULT_ACCENT,
+                                    validate=_check_colour)
+            if typed is CANCELLED:
+                continue
+            chosen = typed or None
+        values["accent"] = chosen
+        menu.apply_theme(chosen)   # take effect straight away, not after saving
+        return
+
+
 # ------------------------------------------------------------ output/quality
 QUALITY_CHOICES = (
     ("low", "smallest files"),
@@ -328,7 +365,8 @@ def _output_menu(screen: Screen, sources: Sources, values: dict) -> None:
 
 
 # --------------------------------------------------------------- the session
-PAGES = {"video": _video_menu, "audio": _audio_menu, "output": _output_menu}
+PAGES = {"video": _video_menu, "audio": _audio_menu, "output": _output_menu,
+         "appearance": _appearance_menu}
 
 
 def _main_items(values: dict, original: dict) -> list[Item]:
@@ -337,6 +375,8 @@ def _main_items(values: dict, original: dict) -> list[Item]:
         Item("Video source", "video", _describe_source(values), tone="info"),
         Item("Audio", "audio", _describe_audio(values), tone="info"),
         Item("Output and quality", "output", _describe_output(values), tone="info"),
+        Item("Menu colour", "appearance", values.get("accent") or menu.DEFAULT_ACCENT,
+             tone="info"),
         Item("Save and exit", "save",
              "write the changes" if edited else "no changes yet",
              tone="good" if edited else "muted"),
@@ -396,9 +436,13 @@ def run(console: Console) -> bool:
 
     path = user_config.config_path()
     original = dict(user_config.load(path).values)
+    menu.apply_theme(original.get("accent"))
 
     with Screen(console) as screen:
         changes = _session(screen, path, original)
+
+    if changes is None:
+        menu.apply_theme(original.get("accent"))   # undo a previewed colour
 
     if changes is None:
         console.print("Nothing written.")
