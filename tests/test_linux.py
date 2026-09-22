@@ -106,5 +106,30 @@ def test_wayland_supports_region_but_not_display_or_window(monkeypatch, tmp_path
 
 
 def test_audio_device_overrides_the_default_monitor(tmp_path):
-    command = LinuxX11Backend(tmp_path / "o.mp4", audio_device="alsa_output.pci.monitor").audio_input_args()
-    assert command[-1] == "alsa_output.pci.monitor"
+    inputs = LinuxX11Backend(tmp_path / "o.mp4", audio_device="alsa_output.pci.monitor").audio_inputs()
+    assert inputs[0][-1] == "alsa_output.pci.monitor"
+
+
+def test_system_audio_and_mic_become_two_mixed_inputs(monkeypatch, tmp_path):
+    monkeypatch.setattr(linux, "default_mic_source", lambda: "alsa_input.mic")
+    backend = LinuxX11Backend(tmp_path / "o.mp4", mic=True)
+    assert len(backend.audio_inputs()) == 2
+    command = backend.capture_command(tmp_path / "s.mkv")
+    graph = command[command.index("-filter_complex") + 1]
+    assert "amix=inputs=2" in graph
+    # Measured: without normalize=0 amix scales each input by 1/n, which drops
+    # system audio by ~4.4 dB the moment a microphone is added.
+    assert "normalize=0" in graph
+    assert "-vf" not in command, "the video filter must move into the complex graph"
+
+
+def test_mic_only_leaves_the_monitor_source_out(monkeypatch, tmp_path):
+    monkeypatch.setattr(linux, "default_mic_source", lambda: "alsa_input.mic")
+    inputs = LinuxX11Backend(tmp_path / "o.mp4", audio=False, mic=True).audio_inputs()
+    assert len(inputs) == 1 and inputs[0][-1] == "alsa_input.mic"
+
+
+def test_wayland_refuses_to_record_both_audio_sources(monkeypatch, tmp_path):
+    monkeypatch.setattr(linux.shutil, "which", lambda name: f"/usr/bin/{name}")
+    with pytest.raises(RuntimeError, match="one audio source at a time"):
+        LinuxWaylandBackend(tmp_path / "o.mp4", audio=True, mic=True).capture_command(tmp_path / "s.mkv")

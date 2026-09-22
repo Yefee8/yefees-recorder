@@ -2,12 +2,12 @@
 
 Cross-platform screen recorder CLI. Windows and Linux are implemented; macOS is not yet.
 
-| Platform | Screen | System audio |
-|---|---|---|
-| Windows | gdigrab | WASAPI loopback, no virtual cable needed |
-| Linux / X11 | x11grab | PulseAudio / PipeWire sink monitor |
-| Linux / Wayland | wf-recorder (wlroots only — not GNOME/KDE) | sink monitor |
-| macOS | avfoundation screen capture | BlackHole or similar virtual device |
+| Platform | Screen | System audio | Microphone |
+|---|---|---|---|
+| Windows | gdigrab | WASAPI loopback, no virtual cable needed | dshow |
+| Linux / X11 | x11grab | PulseAudio / PipeWire sink monitor | PulseAudio source |
+| Linux / Wayland | wf-recorder (wlroots only — not GNOME/KDE) | sink monitor | one source only |
+| macOS | avfoundation screen capture | BlackHole or similar virtual device | avfoundation |
 
 Only the Windows path has been tested on real hardware so far.
 
@@ -38,6 +38,9 @@ yefees-recorder record --display 1                   # one monitor
 yefees-recorder record --window "Firefox"            # one window
 yefees-recorder record --region 0,0,1280x720         # an area, as x,y,WIDTHxHEIGHT
 yefees-recorder record --audio-device "Speakers"     # a specific audio source
+yefees-recorder record --mic                         # add the microphone
+yefees-recorder record --mic --no-audio              # microphone only
+yefees-recorder record --mic-device "Headset"        # a specific microphone
 yefees-recorder record -q high                       # low | balanced | high
 yefees-recorder record --pick                        # choose from a menu instead
 ```
@@ -47,6 +50,17 @@ yefees-recorder record --pick                        # choose from a menu instea
 Press **p** (or space) to pause and resume, **q** to stop. Ctrl+C also stops
 cleanly. Paused time is cut out of the finished file rather than appearing as a
 frozen frame.
+
+### Audio
+
+System audio and the microphone are independent — record either, both or
+neither. With both on they are mixed into a single track at their original
+levels, so adding a microphone does not make the system audio quieter.
+
+`sources` lists every audio device separately as `audio` (what the machine is
+playing) and `mic` (what it can hear). On a machine with several outputs —
+a monitor's speakers and a headset, say — each one is its own `audio` entry,
+so `--audio-device` picks which one is recorded.
 
 ### Presets
 
@@ -99,14 +113,25 @@ Flags always win; the config file only supplies what you leave out.
 
 ```
 yefees-recorder config          # where it lives and what is in effect
+yefees-recorder config --edit   # change settings from a menu, no flags needed
 yefees-recorder config --init   # write a commented starter file
 ```
+
+`config --edit` walks through every setting and offers the devices this machine
+actually has, so you pick a monitor or a microphone from a list instead of
+typing its name. Nothing is written until you save, and your comments survive.
 
 ```toml
 output_dir = "~/Videos"
 fps = 30
 quality = "balanced"
-audio = true
+
+audio = true                    # record what the machine plays
+audio_device = "Speakers"
+mic = false                     # also record the microphone
+mic_device = "Headset"
+audio_offset = 0.0
+
 display = 0
 ```
 

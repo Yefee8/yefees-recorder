@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-All six phases of `plan.md` are implemented. Nothing has been pushed or published yet. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
+All six phases of `plan.md` are implemented, plus microphone capture and an interactive settings editor added afterwards. Nothing has been pushed or published yet. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
 
 Verification status per platform:
 
@@ -58,7 +58,9 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 - **ffmpeg is not bundled** into the pip package (size + GPL licensing). `doctor` checks for it and prints the OS-appropriate install command.
 - **Pause is implemented as segmentation.** ffmpeg has no pause. `pause()` ends the current ffmpeg process, `resume()` starts a new one, and `stop()` muxes each segment with its audio and concatenates them with `-c copy`. Wall-clock time spent paused therefore never reaches the output. Nothing calls `pause()` yet — hotkeys are phase 4; it is exercised by tests.
 - **Segments are `.mkv` internally** (survives an abrupt kill) and only the final concat writes the user's chosen extension.
-- **Audio arrives one of two ways.** If `audio_input_args()` is non-empty the platform can capture system audio through ffmpeg itself and it rides along as a second input (Linux: `-f pulse -i <sink>.monitor`). If it's empty, `make_audio_recorder()` runs a side recorder whose file is muxed in on stop (Windows). Don't mix the two on one backend.
+- **Audio arrives two ways, and Windows uses both at once.** `audio_inputs()` returns one argument list per input ffmpeg can capture directly; `make_audio_recorder()` returns a side recorder whose wav is muxed in on stop. Linux and macOS put system audio *and* the microphone through `audio_inputs()`. Windows can only put the **microphone** there (dshow records mics fine, it just has no loopback), so system audio stays a side recorder and the two are mixed at mux time.
+- **`amix` must be given `normalize=0`.** By default it scales every input by 1/n, so switching the microphone on quietens system audio — measured at 4.4 dB (mean −8.6 → −13.0 dB). Both mix sites set it, and a test pins it.
+- **`-vf` and `-filter_complex` cannot both be passed.** When there is more than one audio input the video filter chain moves into the complex graph as `[0:v]...[vout]`, so anything added to `video_filters()` must keep working in both shapes.
 - **Windows audio does not come from ffmpeg.** dshow exposes no loopback device (verified: `-list_devices` shows only a microphone), so `PyAudioWPatch` captures WASAPI loopback to a wav that is muxed in afterwards.
 - **Record the sink's `.monitor`, not the default source** — the plain default PulseAudio source is the microphone, not system audio.
 - **The loopback wav is built against wall clock, not against the device.** Windows only feeds a loopback stream while something is actually playing — on a fully silent machine the callback never fires at all, and mid-recording silence produces gaps. `WasapiLoopbackRecorder` therefore pads with real silence up to the elapsed-time position on every callback and again at stop. Removing that padding silently desyncs audio from video. Measured after the fix: beeps 4.000 s apart in the source land 3.998 / 4.001 / 3.998 s apart in the output.
@@ -114,6 +116,15 @@ Phase 4 also asked for shell completion. Typer already provides `--install-compl
 Presets are `[presets.NAME]` tables in the same file, merged over the top-level settings and still beaten by flags. `append_preset` appends text rather than re-serialising the parsed document, so hand-written comments survive — there is a test for that, and one for round-tripping values needing TOML escaping (Windows paths, embedded quotes). It refuses to shadow an existing preset, which would be a duplicate-table parse error anyway.
 
 `--pick` shows a `rich` menu of displays and windows (never audio) and returns a `(display, window)` pair. It refuses to run without a TTY and refuses to combine with an explicit `--display/--window/--region`.
+
+## The settings editor
+
+`config --edit` is the no-flags way to change settings, and `--init` offers it straight after creating the file.
+
+- **`set_values()` edits the file line by line**: it rewrites an existing line, uncomments a matching template line, or inserts a new one. It never re-serialises the parsed document, so comments and layout survive.
+- **New settings are inserted before the first table header, never appended.** Appending would drop the key inside the last `[presets.x]` table and silently turn a global setting into part of a preset. There is a test for exactly this.
+- Device settings (`display`, `window`, `audio_device`, `mic_device`) offer the output of `list_sources()` as a numbered list, so the user picks a real device rather than typing a name. `display` is stored as an `int` and everything else as a string — storing `display` as a string would fail the type check on the next load.
+- Nothing is written until the user saves; a rejected value stages nothing.
 
 ## CI
 

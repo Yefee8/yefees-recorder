@@ -11,6 +11,7 @@ keeps the user's own comments safe from being rewritten.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -29,6 +30,8 @@ DEFAULTS: dict[str, Any] = {
     "audio": True,
     "audio_offset": 0.0,
     "audio_device": None,
+    "mic": False,
+    "mic_device": None,
     "display": None,
     "window": None,
     "region": None,
@@ -43,6 +46,8 @@ TYPES: dict[str, Any] = {
     "audio": bool,
     "audio_offset": (int, float),
     "audio_device": str,
+    "mic": bool,
+    "mic_device": str,
     "display": int,
     "window": str,
     "region": str,
@@ -59,9 +64,14 @@ TEMPLATE = """\
 # fps = 30
 # quality = "balanced"   # low | balanced | high
 
+# Record the sound the machine is playing.
 # audio = true
 # audio_device = "Speakers"   # substring of a name from `yefees-recorder sources`
 # audio_offset = 0.0          # seconds; raise if audio runs early
+
+# Record the microphone as well. With both on, the two are mixed into one track.
+# mic = false
+# mic_device = "Microphone"   # substring of a name from `yefees-recorder sources`
 
 # display = 0   # record one monitor by default
 # window = "Firefox"
@@ -87,9 +97,9 @@ def _validate(data: dict[str, Any], where: str) -> tuple[dict[str, Any], list[st
     for key, value in data.items():
         if key not in DEFAULTS:
             warnings.append(f"Unknown setting {key!r} in {where}")
-        elif key == "audio" and not isinstance(value, bool):
+        elif TYPES[key] is bool and not isinstance(value, bool):
             warnings.append(f"{key!r} should be true or false, not {value!r}")
-        elif not isinstance(value, TYPES[key]) or (key != "audio" and isinstance(value, bool)):
+        elif not isinstance(value, TYPES[key]) or (TYPES[key] is not bool and isinstance(value, bool)):
             warnings.append(f"{key!r} has the wrong type in {where}: {value!r}")
         else:
             values[key] = value
@@ -145,6 +155,55 @@ def load(path: Path | None = None) -> Loaded:
             presets[name], preset_warnings = _validate(body, f"preset {name!r}")
             warnings.extend(preset_warnings)
     return Loaded(values, presets, warnings)
+
+
+def set_values(changes: dict[str, Any], path: Path | None = None) -> Path:
+    """Write settings into the config file, editing it line by line.
+
+    Existing lines are rewritten in place, commented-out template lines are
+    uncommented, and anything new is inserted *before the first table header* —
+    appending at the end would silently land the setting inside the last
+    `[presets.x]` table. A value of None removes the setting.
+
+    Editing lines rather than re-serialising the document keeps the user's
+    comments and layout intact.
+    """
+    path = path or config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else TEMPLATE.splitlines()
+
+    def first_table() -> int:
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith("["):
+                return index
+        return len(lines)
+
+    for key, value in changes.items():
+        if key not in DEFAULTS:
+            raise ValueError(f"Unknown setting {key!r}")
+        limit = first_table()
+        live = next(
+            (i for i, l in enumerate(lines[:limit]) if re.match(rf"\s*{key}\s*=", l)), None
+        )
+        commented = next(
+            (i for i, l in enumerate(lines[:limit]) if re.match(rf"\s*#\s*{key}\s*=", l)), None
+        )
+
+        if value is None:
+            if live is not None:
+                del lines[live]
+            continue
+
+        rendered = f"{key} = {_toml_scalar(value)}"
+        if live is not None:
+            lines[live] = rendered
+        elif commented is not None:
+            lines[commented] = rendered
+        else:
+            lines.insert(limit, rendered)
+
+    path.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    return path
 
 
 def append_preset(name: str, values: dict[str, Any], path: Path | None = None) -> Path:

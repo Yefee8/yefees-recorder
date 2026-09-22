@@ -94,12 +94,20 @@ def list_sources() -> list[Source]:
         Source("display", str(position), video[index])
         for position, index in enumerate(screen_device_indices(video))
     ]
-    sources += [
-        Source("audio", name, name + (" (loopback)" if any(
-            hint in name.lower() for hint in LOOPBACK_DEVICE_HINTS) else " (input)"))
-        for name in (audio[i] for i in sorted(audio))
-    ]
+    for index in sorted(audio):
+        name = audio[index]
+        loopback = any(hint in name.lower() for hint in LOOPBACK_DEVICE_HINTS)
+        sources.append(Source("audio" if loopback else "mic", name,
+                              "system audio" if loopback else "microphone"))
     return sources
+
+
+def find_microphone(audio_devices: dict[int, str]) -> int | None:
+    """The first device that is not a loopback, i.e. a real input."""
+    for index, name in sorted(audio_devices.items()):
+        if not any(hint in name.lower() for hint in LOOPBACK_DEVICE_HINTS):
+            return index
+    return None
 
 
 def _coregraphics():
@@ -174,23 +182,37 @@ class MacBackend(CaptureBackend):
             "-i", f"{screen}:none",
         ]
 
-    def audio_input_args(self) -> list[str]:
-        # A second avfoundation input rather than "screen:audio" in one, which
-        # is prone to drift between the two streams.
+    def _named_device(self, wanted: str) -> int:
         devices = self.devices[1]
-        if self.audio_device:
-            wanted = self.audio_device.lower()
-            loopback = next(
-                (i for i, name in sorted(devices.items()) if wanted in name.lower()), None
+        found = next(
+            (i for i, name in sorted(devices.items()) if wanted.lower() in name.lower()), None
+        )
+        if found is None:
+            raise RuntimeError(
+                f"No audio device matching {wanted!r}. Run `yefees-recorder sources`."
             )
+        return found
+
+    def audio_inputs(self) -> list[list[str]]:
+        # Separate avfoundation inputs rather than the combined "screen:audio"
+        # form, which drifts between the streams.
+        inputs = []
+        if self.want_audio:
+            if self.audio_device:
+                loopback = self._named_device(self.audio_device)
+            else:
+                loopback = find_loopback_device(self.devices[1])
             if loopback is None:
-                raise RuntimeError(
-                    f"No audio device matching {self.audio_device!r}. "
-                    "Run `yefees-recorder sources`."
-                )
-        else:
-            loopback = find_loopback_device(devices)
-        if loopback is None:
-            self.audio_error = BLACKHOLE_HELP
-            return []
-        return ["-f", "avfoundation", "-i", f"none:{loopback}"]
+                self.audio_error = BLACKHOLE_HELP
+            else:
+                inputs.append(["-f", "avfoundation", "-i", f"none:{loopback}"])
+        if self.want_mic:
+            if self.mic_device:
+                mic = self._named_device(self.mic_device)
+            else:
+                mic = find_microphone(self.devices[1])
+            if mic is None:
+                self.mic_error = "No microphone found; recording without it."
+            else:
+                inputs.append(["-f", "avfoundation", "-i", f"none:{mic}"])
+        return inputs

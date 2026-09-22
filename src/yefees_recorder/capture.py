@@ -81,6 +81,8 @@ class CaptureBackend(ABC):
         window: str | None = None,
         region: tuple[int, int, int, int] | None = None,
         audio_device: str | None = None,
+        mic: bool = False,
+        mic_device: str | None = None,
     ) -> None:
         self.output = Path(output)
         self.fps = fps
@@ -95,6 +97,11 @@ class CaptureBackend(ABC):
         self.window = window
         self.region = region
         self.audio_device = audio_device
+        # System audio and the microphone are independent: either, both or
+        # neither. When both are on they are mixed down to a single track.
+        self.want_mic = mic
+        self.mic_device = mic_device
+        self.mic_error: str | None = None
         # ponytail: fixed A/V nudge in seconds; per-machine calibration knob.
         # Raise it if audio runs early, lower it if audio runs late.
         self.audio_offset = audio_offset
@@ -112,9 +119,13 @@ class CaptureBackend(ABC):
     def video_input_args(self) -> list[str]:
         """ffmpeg args opening this platform's screen capture device."""
 
-    def audio_input_args(self) -> list[str]:
-        """ffmpeg args for system audio, when the platform can capture it through
-        ffmpeg itself. Empty means "use make_audio_recorder and mux afterwards"."""
+    def audio_inputs(self) -> list[list[str]]:
+        """ffmpeg args for each audio input this platform can capture directly.
+
+        One list per input, so the caller knows how many there are and can mix
+        them. Empty means either that there is no audio, or that it comes from
+        a side recorder instead (Windows system audio).
+        """
         return []
 
     def video_filters(self) -> list[str]:
@@ -123,20 +134,39 @@ class CaptureBackend(ABC):
 
     def capture_command(self, output: Path) -> list[str]:
         """The full command recording one segment to `output`."""
-        audio = self.audio_input_args() if self.want_audio else []
-        return (
-            FFMPEG_BASE
-            + self.video_input_args()
-            + audio
-            + ["-vf", ",".join(self.video_filters()),
-               "-c:v", "libx264", "-preset", self.preset, "-crf", str(self.crf),
-               "-pix_fmt", "yuv420p"]
-            + (["-c:a", "aac"] if audio else [])
-            + [str(output)]
-        )
+        inputs = self.audio_inputs()
+        args = FFMPEG_BASE + self.video_input_args()
+        for one in inputs:
+            args += one
+
+        if len(inputs) > 1:
+            # -vf and -filter_complex cannot both be used, so when several audio
+            # inputs have to be mixed the video filter moves into the complex
+            # graph as well.
+            # normalize=0 keeps each source at its own level; amix otherwise
+            # scales every input by 1/n, which measurably quietens system audio
+            # the moment a microphone is added.
+            taps = "".join(f"[{n}:a]" for n in range(1, len(inputs) + 1))
+            graph = (
+                f"[0:v]{','.join(self.video_filters())}[vout];"
+                f"{taps}amix=inputs={len(inputs)}:duration=longest:normalize=0[aout]"
+            )
+            args += ["-filter_complex", graph, "-map", "[vout]", "-map", "[aout]"]
+        else:
+            args += ["-vf", ",".join(self.video_filters())]
+
+        args += ["-c:v", "libx264", "-preset", self.preset, "-crf", str(self.crf),
+                 "-pix_fmt", "yuv420p"]
+        if inputs:
+            args += ["-c:a", "aac"]
+        return args + [str(output)]
 
     def make_audio_recorder(self):
-        """A system-audio recorder, or None when the platform has no usable one."""
+        """A side recorder for audio ffmpeg cannot capture, or None.
+
+        Used on Windows, where dshow exposes no loopback device. Its output is
+        mixed in afterwards, alongside anything `audio_inputs` captured.
+        """
         return None
 
     @property
@@ -176,7 +206,7 @@ class CaptureBackend(ABC):
         index = len(self._segments)
         video = self.workdir / f"seg{index}.mkv"
         audio = None
-        if self.want_audio and not self.audio_input_args():
+        if self.want_audio or self.want_mic:
             recorder = self.make_audio_recorder()
             if recorder is not None:
                 audio = self.workdir / f"seg{index}.wav"
@@ -221,8 +251,16 @@ class CaptureBackend(ABC):
             return video
         merged = self.workdir / f"mux{index}.mkv"
         offset = ["-itsoffset", str(self.audio_offset)] if self.audio_offset else []
-        _run(["-i", str(video), *offset, "-i", str(audio),
-              "-c:v", "copy", "-c:a", "aac", str(merged)])
+        args = ["-i", str(video), *offset, "-i", str(audio)]
+        if self.audio_inputs():
+            # The segment already carries a track (a microphone, say), so the
+            # side recording has to be mixed with it rather than replace it.
+            args += [
+                "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0[aout]",
+                "-map", "0:v", "-map", "[aout]",
+            ]
+        args += ["-c:v", "copy", "-c:a", "aac", str(merged)]
+        _run(args)
         return merged
 
     def _concat(self, parts: list[Path]) -> None:

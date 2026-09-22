@@ -84,16 +84,25 @@ def list_audio_sources() -> list[str]:
     return names
 
 
+def default_mic_source() -> str:
+    """The default PulseAudio capture source, i.e. the microphone."""
+    result = _read(["pactl", "get-default-source"]).strip()
+    return result or "default"
+
+
 def list_sources() -> list[Source]:
     sources = [
         Source("display", str(index), f"Display {index} — {w}x{h} at ({x},{y})")
         for index, (x, y, w, h) in enumerate(list_monitors())
     ]
     sources += [Source("window", title, title) for _, title in list_windows()]
-    sources += [
-        Source("audio", name, name + (" (system audio)" if name.endswith(".monitor") else ""))
-        for name in list_audio_sources()
-    ]
+    for name in list_audio_sources():
+        # A sink's .monitor is what carries system audio; everything else is an
+        # actual capture device, i.e. a microphone.
+        if name.endswith(".monitor"):
+            sources.append(Source("audio", name, "system audio"))
+        else:
+            sources.append(Source("mic", name, "microphone"))
     return sources
 
 
@@ -140,8 +149,13 @@ class LinuxX11Backend(CaptureBackend):
         # Without -video_size x11grab works the screen size out itself.
         return args + ["-i", display]
 
-    def audio_input_args(self) -> list[str]:
-        return ["-f", "pulse", "-i", self.audio_device or default_monitor_source()]
+    def audio_inputs(self) -> list[list[str]]:
+        inputs = []
+        if self.want_audio:
+            inputs.append(["-f", "pulse", "-i", self.audio_device or default_monitor_source()])
+        if self.want_mic:
+            inputs.append(["-f", "pulse", "-i", self.mic_device or default_mic_source()])
+        return inputs
 
 
 class LinuxWaylandBackend(CaptureBackend):
@@ -160,10 +174,18 @@ class LinuxWaylandBackend(CaptureBackend):
                 "compositor decides what a recorder may see. Use --region, or run "
                 "wf-recorder directly with its own -o/-g options."
             )
+        if self.want_audio and self.want_mic:
+            raise RuntimeError(
+                "wf-recorder records one audio source at a time, so system audio and "
+                "the microphone cannot both be captured on Wayland. Turn one off, or "
+                "mix them into a virtual sink with pactl first."
+            )
         command = ["wf-recorder", "-f", str(output)]
         if self.region:
             x, y, width, height = self.region
             command += ["-g", f"{x},{y} {width}x{height}"]
         if self.want_audio:
             command.append(f"--audio={self.audio_device or default_monitor_source()}")
+        elif self.want_mic:
+            command.append(f"--audio={self.mic_device or default_mic_source()}")
         return command

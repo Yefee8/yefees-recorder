@@ -14,7 +14,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.prompt import IntPrompt
+from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
 from . import config as user_config
@@ -54,7 +54,12 @@ class Quality(str, Enum):
     high = "high"
 
 
-SELECT_WITH = {"display": "--display", "window": "--window", "audio": "--audio-device"}
+SELECT_WITH = {
+    "display": "--display",
+    "window": "--window",
+    "audio": "--audio-device",
+    "mic": "--mic-device",
+}
 
 
 def _version_callback(value: bool) -> None:
@@ -122,7 +127,9 @@ def record(
     display: int = typer.Option(None, "--display", help="Record one monitor (see `sources`)."),
     window: str = typer.Option(None, "--window", help="Record one window by title (see `sources`)."),
     region: str = typer.Option(None, "--region", help="Record an area, as x,y,WIDTHxHEIGHT."),
-    audio_device: str = typer.Option(None, "--audio-device", help="Audio source to record (see `sources`)."),
+    audio_device: str = typer.Option(None, "--audio-device", help="System audio source (see `sources`)."),
+    mic: bool = typer.Option(None, "--mic/--no-mic", help="Also record the microphone. [default: off]"),
+    mic_device: str = typer.Option(None, "--mic-device", help="Microphone to record (see `sources`)."),
     audio_offset: float = typer.Option(None, "--audio-offset", help="Shift audio by N seconds if it drifts. [default: 0]"),
     pick: bool = typer.Option(False, "--pick", help="Choose what to record from a menu."),
     preset: str = typer.Option(None, "--preset", help="Use a saved preset (see `config`)."),
@@ -144,6 +151,7 @@ def record(
             for key, value in (
                 ("fps", fps), ("quality", quality.value if quality else None),
                 ("audio", audio), ("audio_device", audio_device),
+                ("mic", mic), ("mic_device", mic_device),
                 ("audio_offset", audio_offset), ("display", display),
                 ("window", window), ("region", region),
             )
@@ -190,6 +198,8 @@ def record(
     audio = user_config.resolve("audio", audio, settings)
     audio_offset = user_config.resolve("audio_offset", audio_offset, settings)
     audio_device = user_config.resolve("audio_device", audio_device, settings)
+    mic = user_config.resolve("mic", mic, settings)
+    mic_device = user_config.resolve("mic_device", mic_device, settings)
     quality_name = user_config.resolve("quality", quality.value if quality else None, settings)
 
     if output is None:
@@ -201,7 +211,7 @@ def record(
         backend = get_backend(
             output, fps=fps, audio=audio, audio_offset=audio_offset,
             quality=quality_name, display=display, window=window,
-            region=area, audio_device=audio_device,
+            region=area, audio_device=audio_device, mic=mic, mic_device=mic_device,
         )
     except (NotImplementedError, ValueError) as exc:
         console.print(f"[red]{exc}[/]")
@@ -215,7 +225,8 @@ def record(
 
     if audio and getattr(backend, "audio_error", None):
         console.print(f"[yellow]{backend.audio_error}[/]")
-        console.print("[yellow]Recording video only.[/]")
+    if mic and getattr(backend, "mic_error", None):
+        console.print(f"[yellow]{backend.mic_error}[/]")
 
     if keys.interactive():
         console.print("[green]Recording[/] - [bold]p[/] pause/resume, [bold]q[/] stop.")
@@ -280,7 +291,7 @@ def sources() -> None:
     table.add_column("kind")
     table.add_column("select with")
     table.add_column("details")
-    for kind in ("display", "window", "audio"):
+    for kind in ("display", "window", "audio", "mic"):
         for source in (s for s in found if s.kind == kind):
             flag = (
                 f"--display {source.id}" if kind == "display"
@@ -328,14 +339,22 @@ def _pick_source() -> tuple[int | None, str | None]:
 @app.command()
 def config(
     init: bool = typer.Option(False, "--init", help="Write a commented config file if none exists."),
+    edit: bool = typer.Option(False, "-e", "--edit", help="Change settings interactively."),
 ) -> None:
-    """Show where settings are read from, and what is in effect."""
+    """Show, create or interactively edit the settings."""
     path = user_config.config_path()
     if init:
         if path.exists():
             console.print(f"[yellow]Already exists, leaving it alone:[/] {path}")
         else:
             console.print(f"[green]Created[/] {user_config.write_template()}")
+        # Creating an empty file is rarely the point; offer to fill it in.
+        if not edit and keys.interactive() and Confirm.ask("Edit the settings now?", default=True):
+            edit = True
+
+    if edit:
+        _edit_config()
+        return
 
     loaded = user_config.load()
     settings = loaded.values
@@ -360,3 +379,145 @@ def config(
         for name, body in sorted(loaded.presets.items()):
             saved.add_row(name, ", ".join(f"{k}={v}" for k, v in sorted(body.items())))
         console.print(saved)
+
+    console.print("[dim]Change these with: yefees-recorder config --edit[/]")
+
+
+# Each setting, with the label shown in the editor and how it is entered.
+# The "kind" is either a plain type or the source kind to offer a list of.
+EDITABLE = [
+    ("output_dir", "Where recordings are saved", "text"),
+    ("fps", "Frames per second", "int"),
+    ("quality", "Encoding quality", "quality"),
+    ("audio", "Record system audio", "bool"),
+    ("audio_device", "System audio source", "audio"),
+    ("mic", "Record the microphone", "bool"),
+    ("mic_device", "Microphone", "mic"),
+    ("audio_offset", "Audio offset, seconds", "float"),
+    ("display", "Default monitor", "display"),
+    ("window", "Default window", "window"),
+    ("region", "Default area, x,y,WIDTHxHEIGHT", "region"),
+]
+
+UNCHANGED = object()
+
+
+def _sources_of(kind: str):
+    try:
+        return [s for s in list_sources() if s.kind == kind]
+    except (NotImplementedError, OSError):
+        return []
+
+
+def _shown(value) -> str:
+    if value is None:
+        return "[dim]automatic[/]"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def _choose_source(kind: str, current):
+    """Offer the devices this machine actually has, with a free-text way out."""
+    found = _sources_of(kind)
+    if not found:
+        console.print(f"[yellow]No {kind} sources detected; type a name instead.[/]")
+        typed = Prompt.ask("Name (blank for automatic)", default="").strip()
+        return typed or None
+
+    table = Table(show_header=False, box=None)
+    table.add_row("[bold]0[/]", "[dim]automatic[/]")
+    for number, source in enumerate(found, start=1):
+        label = source.id if source.name == source.id else f"{source.id}  ({source.name})"
+        table.add_row(f"[bold]{number}[/]", label)
+    console.print(table)
+
+    answer = IntPrompt.ask(
+        "Which one", choices=[str(i) for i in range(len(found) + 1)], show_choices=False, default=0
+    )
+    if answer == 0:
+        return None
+    picked = found[answer - 1].id
+    return int(picked) if kind == "display" else picked
+
+
+def _edit_setting(key: str, label: str, kind: str, current):
+    """Ask for one new value. Returns UNCHANGED if the user backs out."""
+    if kind == "bool":
+        return Confirm.ask(label, default=bool(current))
+    if kind == "quality":
+        return Prompt.ask(label, choices=[q.value for q in Quality], default=str(current or "balanced"))
+    if kind in ("audio", "mic", "display", "window"):
+        return _choose_source(kind, current)
+
+    typed = Prompt.ask(f"{label} (blank for automatic)", default="" if current is None else str(current))
+    typed = typed.strip()
+    if not typed:
+        return None
+    if kind == "int":
+        if not typed.lstrip("-").isdigit():
+            console.print("[red]That is not a whole number.[/]")
+            return UNCHANGED
+        return int(typed)
+    if kind == "float":
+        try:
+            return float(typed)
+        except ValueError:
+            console.print("[red]That is not a number.[/]")
+            return UNCHANGED
+    if kind == "region":
+        try:
+            parse_region(typed)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/]")
+            return UNCHANGED
+    return typed
+
+
+def _edit_config() -> None:
+    """Interactive settings editor. Nothing is written until you save."""
+    if not keys.interactive():
+        console.print("[red]Editing settings needs an interactive terminal.[/]")
+        raise typer.Exit(1)
+
+    path = user_config.config_path()
+    saved = user_config.load().values
+    pending: dict = {}
+
+    while True:
+        effective = {**saved, **pending}
+        table = Table(title=f"Settings  —  {path}")
+        table.add_column("#", justify="right")
+        table.add_column("setting")
+        table.add_column("value")
+        table.add_column("")
+        for number, (key, label, _kind) in enumerate(EDITABLE, start=1):
+            value = effective.get(key, user_config.DEFAULTS[key])
+            changed = key in pending
+            table.add_row(
+                str(number), label, _shown(value), "[yellow]edited[/]" if changed else ""
+            )
+        console.print(table)
+        console.print("[dim]Number to change a setting, s to save, q to quit.[/]")
+
+        answer = Prompt.ask("Choose", default="s").strip().lower()
+        if answer == "q":
+            if pending and not Confirm.ask("Discard your changes?", default=False):
+                continue
+            console.print("Nothing written.")
+            return
+        if answer == "s":
+            if not pending:
+                console.print("No changes to save.")
+                return
+            user_config.set_values(pending, path)
+            console.print(f"[green]Saved[/] {len(pending)} setting(s) to {path}")
+            return
+        if not answer.isdigit() or not 1 <= int(answer) <= len(EDITABLE):
+            console.print("[red]Pick one of the numbers listed, or s / q.[/]")
+            continue
+
+        key, label, kind = EDITABLE[int(answer) - 1]
+        new = _edit_setting(key, label, kind, effective.get(key, user_config.DEFAULTS[key]))
+        if new is not UNCHANGED:
+            pending[key] = new
