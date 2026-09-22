@@ -20,8 +20,22 @@ def test_doctor_fails_when_tool_missing(monkeypatch):
 
 def test_doctor_passes_when_tools_present(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
+    # On a real Mac doctor also checks Screen Recording, and a machine running
+    # the tests has no reason to have granted it.
+    monkeypatch.setattr("yefees_recorder.macos.screen_recording_permitted", lambda: True)
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
+
+
+def test_doctor_fails_when_screen_recording_is_denied(monkeypatch):
+    """Without the grant avfoundation hands ffmpeg no frames at all, measured on
+    macOS 14 - not the black frames the docs assumed. doctor must not pass it."""
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr("yefees_recorder.macos.screen_recording_permitted", lambda: False)
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert "Screen Recording" in result.stdout
 
 
 def test_version():

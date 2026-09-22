@@ -47,6 +47,23 @@ def interactive() -> bool:
         return False
 
 
+def _terminal_state() -> tuple[int, list] | None:
+    """stdin's descriptor and its current settings, or None when it has neither.
+
+    isatty() can say yes for a stream that has no descriptor behind it - a
+    captured stdin is exactly that - and termios refuses anything that is not a
+    real tty. Either case leaves nothing to switch, so raw_mode does nothing
+    rather than raising in the middle of a recording.
+    """
+    if WINDOWS or not interactive():
+        return None
+    try:
+        descriptor = sys.stdin.fileno()
+        return descriptor, termios.tcgetattr(descriptor)
+    except (OSError, ValueError, termios.error):
+        return None
+
+
 @contextlib.contextmanager
 def raw_mode():
     """Deliver keystrokes one at a time instead of a line at a time.
@@ -54,11 +71,11 @@ def raw_mode():
     Ctrl+C keeps working: cbreak leaves signal handling on, and the Windows
     console raises KeyboardInterrupt regardless.
     """
-    if WINDOWS or not interactive():
+    state = _terminal_state()
+    if state is None:
         yield  # the Windows console is already unbuffered; nothing to restore
         return
-    descriptor = sys.stdin.fileno()
-    saved = termios.tcgetattr(descriptor)
+    descriptor, saved = state
     try:
         tty.setcbreak(descriptor)
         yield

@@ -6,6 +6,8 @@ turn the wait loop into a busy spin that never sees a keypress. These tests
 pin the behaviour the stdlib replacement has to keep.
 """
 
+import io
+import sys
 import time
 
 import pytest
@@ -18,6 +20,28 @@ def test_read_key_honours_its_timeout_when_nothing_is_typed():
     with keys.raw_mode():
         assert keys.read_key(0.3) is None
     assert time.monotonic() - start >= 0.25, "returning early would busy-spin the wait loop"
+
+
+class NoDescriptor:
+    """A stdin that claims to be a terminal but has no file descriptor."""
+
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        raise io.UnsupportedOperation("redirected stdin is pseudofile, has no fileno()")
+
+
+def test_raw_mode_is_a_no_op_when_stdin_has_no_descriptor(monkeypatch):
+    """A captured stdin is a terminal by isatty() and has no descriptor at all.
+
+    Windows never hit this because raw_mode short-circuits before it looks at
+    stdin; on POSIX it took out every test that goes through the wait loop.
+    """
+    monkeypatch.setattr(keys, "interactive", lambda: True)
+    monkeypatch.setattr(sys, "stdin", NoDescriptor())
+    with keys.raw_mode():
+        pass
 
 
 def test_raw_mode_restores_itself_even_if_the_body_raises():
