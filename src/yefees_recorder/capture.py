@@ -1,9 +1,15 @@
 """Capture engine.
 
 ffmpeg does the capturing and encoding; each platform backend only supplies the
-input arguments for its screen-grab device and (optionally) a system-audio
-recorder. Pause works by ending the current ffmpeg segment and starting a new
-one on resume; segments are muxed with their audio and concatenated on stop.
+input arguments for its screen-grab device, and gets system audio either as a
+second ffmpeg input (Linux) or from a side recorder that is muxed in afterwards
+(Windows, where dshow has no loopback device).
+
+Pause works by ending the current capture process and starting a new one on
+resume; segments are muxed with their audio and concatenated on stop.
+
+A backend that cannot use ffmpeg at all (Wayland) overrides `capture_command`
+with its own recorder and keeps the rest of the lifecycle.
 """
 
 from __future__ import annotations
@@ -53,9 +59,30 @@ class CaptureBackend(ABC):
         self._proc: subprocess.Popen | None = None
         self._audio = None
 
+    # How to ask the capture process to finish. None means ffmpeg: write "q" to
+    # its stdin. Anything else is a signal number to send instead.
+    stop_signal = None
+
     @abstractmethod
     def video_input_args(self) -> list[str]:
         """ffmpeg args opening this platform's screen capture device."""
+
+    def audio_input_args(self) -> list[str]:
+        """ffmpeg args for system audio, when the platform can capture it through
+        ffmpeg itself. Empty means "use make_audio_recorder and mux afterwards"."""
+        return []
+
+    def capture_command(self, output: Path) -> list[str]:
+        """The full command recording one segment to `output`."""
+        audio = self.audio_input_args() if self.want_audio else []
+        return (
+            FFMPEG_BASE
+            + self.video_input_args()
+            + audio
+            + ["-vf", EVEN_DIMS, "-c:v", "libx264", "-preset", self.preset, "-pix_fmt", "yuv420p"]
+            + (["-c:a", "aac"] if audio else [])
+            + [str(output)]
+        )
 
     def make_audio_recorder(self):
         """A system-audio recorder, or None when the platform has no usable one."""
@@ -98,17 +125,14 @@ class CaptureBackend(ABC):
         index = len(self._segments)
         video = self.workdir / f"seg{index}.mkv"
         audio = None
-        if self.want_audio:
+        if self.want_audio and not self.audio_input_args():
             recorder = self.make_audio_recorder()
             if recorder is not None:
                 audio = self.workdir / f"seg{index}.wav"
                 recorder.start(audio)
                 self._audio = recorder
         self._proc = subprocess.Popen(
-            FFMPEG_BASE
-            + self.video_input_args()
-            + ["-vf", EVEN_DIMS, "-c:v", "libx264", "-preset", self.preset,
-               "-pix_fmt", "yuv420p", str(video)],
+            self.capture_command(video),
             stdin=subprocess.PIPE,
             creationflags=_NEW_GROUP,
         )
@@ -121,8 +145,11 @@ class CaptureBackend(ABC):
                 self._audio = None
             return
         try:
-            self._proc.stdin.write(b"q")  # graceful stop: ffmpeg finalizes the file
-            self._proc.stdin.flush()
+            if self.stop_signal is None:
+                self._proc.stdin.write(b"q")  # ffmpeg finalizes the file on "q"
+                self._proc.stdin.flush()
+            else:
+                self._proc.send_signal(self.stop_signal)
             # Stop audio between the signal and the wait, so the two streams end
             # within a few ms of each other instead of a device-teardown apart.
             if self._audio is not None:
@@ -157,11 +184,19 @@ def get_backend(output: Path, **kwargs) -> CaptureBackend:
     """The recorder for the current OS."""
     import platform
 
+    import os
+
     system = platform.system()
     if system == "Windows":
         from .windows import WindowsBackend
 
         return WindowsBackend(output, **kwargs)
+    if system == "Linux":
+        from .linux import LinuxWaylandBackend, LinuxX11Backend
+
+        wayland = os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        backend = LinuxWaylandBackend if wayland else LinuxX11Backend
+        return backend(output, **kwargs)
     raise NotImplementedError(
-        f"{system} backend is not implemented yet (phases 1a/1b) — Windows only for now."
+        f"{system} backend is not implemented yet (phase 1b) — Linux and Windows only for now."
     )

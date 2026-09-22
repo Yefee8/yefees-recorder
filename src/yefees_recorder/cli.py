@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import shutil
 import time
@@ -23,8 +24,17 @@ console = Console()
 INSTALL_HINTS = {
     "Windows": {"ffmpeg": "winget install Gyan.FFmpeg"},
     "Darwin": {"ffmpeg": "brew install ffmpeg"},
-    "Linux": {"ffmpeg": "sudo apt install ffmpeg"},
+    "Linux": {"ffmpeg": "sudo apt install ffmpeg", "wf-recorder": "sudo apt install wf-recorder"},
 }
+
+
+def required_tools() -> tuple[str, ...]:
+    """ffmpeg everywhere, plus wf-recorder on Wayland where ffmpeg cannot capture."""
+    on_wayland = (
+        platform.system() == "Linux"
+        and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    )
+    return ("ffmpeg", "wf-recorder") if on_wayland else ("ffmpeg",)
 
 
 def install_hint(tool: str, system: str | None = None) -> str:
@@ -50,14 +60,14 @@ def _main(
 
 @app.command()
 def doctor() -> None:
-    """Check that ffmpeg is installed."""
+    """Check that the tools needed to record on this system are installed."""
     table = Table(title="yefees-recorder doctor")
     table.add_column("tool")
     table.add_column("status")
     table.add_column("path / how to install")
 
     missing = []
-    for tool in ("ffmpeg",):
+    for tool in required_tools():
         path = shutil.which(tool)
         if path:
             table.add_row(tool, "[green]ok[/]", path)

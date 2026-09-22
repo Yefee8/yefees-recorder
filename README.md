@@ -1,6 +1,15 @@
 # yefees-recorder
 
-Cross-platform screen recorder CLI. **Windows only so far** — Linux and macOS backends are not implemented yet.
+Cross-platform screen recorder CLI. Windows and Linux are implemented; macOS is not yet.
+
+| Platform | Screen | System audio |
+|---|---|---|
+| Windows | gdigrab | WASAPI loopback, no virtual cable needed |
+| Linux / X11 | x11grab | PulseAudio / PipeWire sink monitor |
+| Linux / Wayland | wf-recorder (wlroots only — not GNOME/KDE) | sink monitor |
+| macOS | not implemented | — |
+
+Only the Windows path has been tested on real hardware so far.
 
 ffmpeg is not bundled; install it first:
 
@@ -19,9 +28,13 @@ yefees-recorder record -d 30 -o clip.mp4
 yefees-recorder record --no-audio --fps 60
 ```
 
-On Windows the screen is captured with gdigrab and system audio with WASAPI
-loopback — no virtual audio cable needed. If audio ends up slightly ahead of or
-behind the video on your machine, nudge it with `--audio-offset 0.2`.
+If audio ends up slightly ahead of or behind the video on your machine, nudge it
+with `--audio-offset 0.2`.
+
+On Wayland, ffmpeg cannot capture the screen — access is only available through
+xdg-desktop-portal/PipeWire — so `wf-recorder` is required. It supports wlroots
+compositors (Sway, Hyprland, river). On GNOME or KDE, use your desktop's own
+recorder or run an X11 session.
 
 ## Development
 

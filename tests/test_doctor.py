@@ -1,6 +1,6 @@
 from typer.testing import CliRunner
 
-from yefees_recorder.cli import app, install_hint
+from yefees_recorder.cli import app, install_hint, required_tools
 
 runner = CliRunner()
 
@@ -28,3 +28,11 @@ def test_version():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert result.stdout.strip()
+
+
+def test_wayland_also_needs_wf_recorder(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    assert required_tools() == ("ffmpeg", "wf-recorder")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
+    assert required_tools() == ("ffmpeg",)
