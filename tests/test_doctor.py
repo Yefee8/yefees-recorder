@@ -6,9 +6,9 @@ runner = CliRunner()
 
 
 def test_install_hint_per_platform():
-    assert install_hint("mpv", "Darwin") == "brew install mpv"
+    assert install_hint("ffmpeg", "Darwin") == "brew install ffmpeg"
     assert install_hint("ffmpeg", "Windows") == "winget install Gyan.FFmpeg"
-    assert "package manager" in install_hint("mpv", "Haiku")
+    assert "package manager" in install_hint("ffmpeg", "Haiku")
 
 
 def test_doctor_fails_when_tool_missing(monkeypatch):
