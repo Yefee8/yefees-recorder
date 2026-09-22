@@ -17,7 +17,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .capture import CaptureBackend
+from .capture import CaptureBackend, Source
 
 # Virtual output devices that loop system audio back to an input.
 LOOPBACK_DEVICE_HINTS = ("blackhole", "soundflower", "loopback audio", "ishowu", "multi-output")
@@ -83,6 +83,25 @@ def find_loopback_device(audio_devices: dict[int, str]) -> int | None:
     return None
 
 
+def screen_device_indices(video_devices: dict[int, str]) -> list[int]:
+    """avfoundation indices of the screens, in order — index 0 is usually a camera."""
+    return [i for i, name in sorted(video_devices.items()) if name.lower().startswith("capture screen")]
+
+
+def list_sources() -> list[Source]:
+    video, audio = list_avfoundation_devices()
+    sources = [
+        Source("display", str(position), video[index])
+        for position, index in enumerate(screen_device_indices(video))
+    ]
+    sources += [
+        Source("audio", name, name + (" (loopback)" if any(
+            hint in name.lower() for hint in LOOPBACK_DEVICE_HINTS) else " (input)"))
+        for name in (audio[i] for i in sorted(audio))
+    ]
+    return sources
+
+
 def _coregraphics():
     return ctypes.cdll.LoadLibrary(
         "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
@@ -120,16 +139,34 @@ class MacBackend(CaptureBackend):
             self._devices = list_avfoundation_devices()
         return self._devices
 
+    def video_filters(self) -> list[str]:
+        # avfoundation grabs a whole screen, so a region has to be cropped after.
+        if not self.region:
+            return super().video_filters()
+        x, y, width, height = self.region
+        return [f"crop={width}:{height}:{x}:{y}", *super().video_filters()]
+
     def video_input_args(self) -> list[str]:
+        if self.window:
+            raise RuntimeError(
+                "avfoundation cannot record a single window — it only exposes whole "
+                "screens. Use --region to crop to the window's area instead."
+            )
         if screen_recording_permitted() is False:
             request_screen_recording()  # surfaces the system prompt
             raise RuntimeError(PERMISSION_HELP)
-        screen = find_screen_device(self.devices[0])
-        if screen is None:
+        screens = screen_device_indices(self.devices[0])
+        if not screens:
             raise RuntimeError(
                 "ffmpeg found no 'Capture screen' device. This usually means Screen "
                 "Recording permission is missing for this terminal."
             )
+        if self.display is not None and self.display >= len(screens):
+            raise RuntimeError(
+                f"No display {self.display}; this Mac exposes {len(screens)}. "
+                "Run `yefees-recorder sources`."
+            )
+        screen = screens[self.display or 0]
         return [
             "-f", "avfoundation",
             "-framerate", str(self.fps),
@@ -140,7 +177,19 @@ class MacBackend(CaptureBackend):
     def audio_input_args(self) -> list[str]:
         # A second avfoundation input rather than "screen:audio" in one, which
         # is prone to drift between the two streams.
-        loopback = find_loopback_device(self.devices[1])
+        devices = self.devices[1]
+        if self.audio_device:
+            wanted = self.audio_device.lower()
+            loopback = next(
+                (i for i, name in sorted(devices.items()) if wanted in name.lower()), None
+            )
+            if loopback is None:
+                raise RuntimeError(
+                    f"No audio device matching {self.audio_device!r}. "
+                    "Run `yefees-recorder sources`."
+                )
+        else:
+            loopback = find_loopback_device(devices)
         if loopback is None:
             self.audio_error = BLACKHOLE_HELP
             return []

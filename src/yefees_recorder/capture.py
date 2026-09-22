@@ -17,13 +17,45 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import NamedTuple
 
 FFMPEG_BASE = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
 
 # gdigrab/x11grab can hand back odd dimensions, which yuv420p cannot encode.
 EVEN_DIMS = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+
+# x264 speed/size trade-offs. Screen capture is realtime, so even "high" stays
+# well away from the slow presets — dropping frames costs more than bitrate does.
+QUALITY_PRESETS = {
+    "low": ("veryfast", 32),
+    "balanced": ("veryfast", 26),
+    "high": ("medium", 20),
+}
+
+REGION = re.compile(r"^\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*x\s*(\d+)\s*$")
+
+
+class Source(NamedTuple):
+    """Something that can be recorded, as offered to the user."""
+
+    kind: str   # "display", "window" or "audio"
+    id: str     # what to pass back on the command line
+    name: str   # human-readable label
+
+
+def parse_region(text: str) -> tuple[int, int, int, int]:
+    """`x,y,WxH` -> (x, y, width, height)."""
+    match = REGION.match(text)
+    if not match:
+        raise ValueError(f"expected a region like 0,0,1920x1080 — got {text!r}")
+    x, y, width, height = (int(g) for g in match.groups())
+    if width <= 0 or height <= 0:
+        raise ValueError(f"region must have a positive size — got {text!r}")
+    return x, y, width, height
+
 
 # Don't let Ctrl+C in our terminal reach ffmpeg; we stop it deliberately with "q".
 _NEW_GROUP = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -43,13 +75,26 @@ class CaptureBackend(ABC):
         output: Path,
         fps: int = 30,
         audio: bool = True,
-        preset: str = "ultrafast",
+        quality: str = "balanced",
         audio_offset: float = 0.0,
+        display: int | None = None,
+        window: str | None = None,
+        region: tuple[int, int, int, int] | None = None,
+        audio_device: str | None = None,
     ) -> None:
         self.output = Path(output)
         self.fps = fps
         self.want_audio = audio
-        self.preset = preset
+        if quality not in QUALITY_PRESETS:
+            raise ValueError(f"unknown quality {quality!r}; pick one of {sorted(QUALITY_PRESETS)}")
+        self.preset, self.crf = QUALITY_PRESETS[quality]
+        # Which screen, window or area to record, and which audio device to use.
+        # A backend resolves `display` into a region if that is how its capture
+        # device addresses monitors.
+        self.display = display
+        self.window = window
+        self.region = region
+        self.audio_device = audio_device
         # ponytail: fixed A/V nudge in seconds; per-machine calibration knob.
         # Raise it if audio runs early, lower it if audio runs late.
         self.audio_offset = audio_offset
@@ -72,6 +117,10 @@ class CaptureBackend(ABC):
         ffmpeg itself. Empty means "use make_audio_recorder and mux afterwards"."""
         return []
 
+    def video_filters(self) -> list[str]:
+        """Filters applied to the captured video, innermost first."""
+        return [EVEN_DIMS]
+
     def capture_command(self, output: Path) -> list[str]:
         """The full command recording one segment to `output`."""
         audio = self.audio_input_args() if self.want_audio else []
@@ -79,7 +128,9 @@ class CaptureBackend(ABC):
             FFMPEG_BASE
             + self.video_input_args()
             + audio
-            + ["-vf", EVEN_DIMS, "-c:v", "libx264", "-preset", self.preset, "-pix_fmt", "yuv420p"]
+            + ["-vf", ",".join(self.video_filters()),
+               "-c:v", "libx264", "-preset", self.preset, "-crf", str(self.crf),
+               "-pix_fmt", "yuv420p"]
             + (["-c:a", "aac"] if audio else [])
             + [str(output)]
         )
@@ -178,6 +229,26 @@ class CaptureBackend(ABC):
         listing = self.workdir / "segments.txt"
         listing.write_text("\n".join(f"file '{p.as_posix()}'" for p in parts), encoding="utf-8")
         _run(["-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(self.output)])
+
+
+def _platform_module():
+    """The module implementing this OS, or None when there isn't one."""
+    import importlib
+    import platform
+
+    modules = {"Windows": ".windows", "Darwin": ".macos", "Linux": ".linux"}
+    name = modules.get(platform.system())
+    return importlib.import_module(name, __package__) if name else None
+
+
+def list_sources() -> list[Source]:
+    """Every display, window and audio device this OS can offer."""
+    import platform
+
+    module = _platform_module()
+    if module is None or not hasattr(module, "list_sources"):
+        raise NotImplementedError(f"Cannot enumerate sources on {platform.system()}.")
+    return module.list_sources()
 
 
 def get_backend(output: Path, **kwargs) -> CaptureBackend:

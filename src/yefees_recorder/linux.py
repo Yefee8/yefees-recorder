@@ -13,12 +13,16 @@ merged upstream. So the Wayland backend delegates to wf-recorder.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
 from pathlib import Path
 
-from .capture import CaptureBackend
+from .capture import CaptureBackend, Source
+
+# `xrandr --listmonitors` prints e.g. " 1: +HDMI-1 1920/521x1080/293+1920+0  HDMI-1"
+MONITOR_LINE = re.compile(r"(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)")
 
 WAYLAND_HELP = (
     "Recording on Wayland needs wf-recorder, which is not installed.\n"
@@ -30,6 +34,67 @@ WAYLAND_HELP = (
     "wf-recorder supports wlroots compositors (Sway, Hyprland, river). On GNOME or "
     "KDE, use your desktop's own screen recorder for now, or run an X11 session."
 )
+
+
+def _read(command: list[str]) -> str:
+    """stdout of `command`, or "" if the tool is missing or fails."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def list_monitors() -> list[tuple[int, int, int, int]]:
+    """Each monitor as (x, y, width, height), from xrandr."""
+    monitors = []
+    for line in _read(["xrandr", "--listmonitors"]).splitlines():
+        found = MONITOR_LINE.search(line)
+        if found:
+            width, height, x, y = (int(g) for g in found.groups())
+            monitors.append((x, y, width, height))
+    return monitors
+
+
+def list_windows() -> list[tuple[str, str]]:
+    """(window id, title) pairs from wmctrl, which reports both in one go."""
+    windows = []
+    for line in _read(["wmctrl", "-l"]).splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4:
+            windows.append((parts[0], parts[3]))
+    return windows
+
+
+def resolve_window_id(title: str) -> str:
+    matches = [(wid, name) for wid, name in list_windows() if title.lower() in name.lower()]
+    if not matches:
+        if not shutil.which("wmctrl"):
+            raise RuntimeError("Selecting a window needs wmctrl (sudo apt install wmctrl).")
+        raise RuntimeError(f"No window matching {title!r}. Run `yefees-recorder sources`.")
+    return matches[0][0]
+
+
+def list_audio_sources() -> list[str]:
+    names = []
+    for line in _read(["pactl", "list", "short", "sources"]).splitlines():
+        fields = line.split("	")
+        if len(fields) > 1:
+            names.append(fields[1])
+    return names
+
+
+def list_sources() -> list[Source]:
+    sources = [
+        Source("display", str(index), f"Display {index} — {w}x{h} at ({x},{y})")
+        for index, (x, y, w, h) in enumerate(list_monitors())
+    ]
+    sources += [Source("window", title, title) for _, title in list_windows()]
+    sources += [
+        Source("audio", name, name + (" (system audio)" if name.endswith(".monitor") else ""))
+        for name in list_audio_sources()
+    ]
+    return sources
 
 
 def default_monitor_source() -> str:
@@ -50,12 +115,33 @@ def default_monitor_source() -> str:
 
 
 class LinuxX11Backend(CaptureBackend):
+    def _display_region(self) -> tuple[int, int, int, int] | None:
+        if self.display is None:
+            return None
+        monitors = list_monitors()
+        if self.display >= len(monitors):
+            raise RuntimeError(
+                f"No display {self.display}; xrandr reports {len(monitors)}. "
+                "Run `yefees-recorder sources`."
+            )
+        return monitors[self.display]
+
     def video_input_args(self) -> list[str]:
-        # x11grab works out the screen size itself when -video_size is omitted.
-        return ["-f", "x11grab", "-framerate", str(self.fps), "-i", os.environ.get("DISPLAY", ":0.0")]
+        args = ["-f", "x11grab", "-framerate", str(self.fps)]
+        display = os.environ.get("DISPLAY", ":0.0")
+        if self.window:
+            # x11grab sizes itself from the window, so no -video_size here.
+            return args + ["-window_id", resolve_window_id(self.window), "-i", display]
+        region = self.region or self._display_region()
+        if region:
+            x, y, width, height = region
+            args += ["-video_size", f"{width}x{height}"]
+            display = f"{display}+{x},{y}"
+        # Without -video_size x11grab works the screen size out itself.
+        return args + ["-i", display]
 
     def audio_input_args(self) -> list[str]:
-        return ["-f", "pulse", "-i", default_monitor_source()]
+        return ["-f", "pulse", "-i", self.audio_device or default_monitor_source()]
 
 
 class LinuxWaylandBackend(CaptureBackend):
@@ -68,7 +154,16 @@ class LinuxWaylandBackend(CaptureBackend):
     def capture_command(self, output: Path) -> list[str]:
         if not shutil.which("wf-recorder"):
             raise RuntimeError(WAYLAND_HELP)
+        if self.window is not None or self.display is not None:
+            raise RuntimeError(
+                "Selecting a window or display is not supported on Wayland — the "
+                "compositor decides what a recorder may see. Use --region, or run "
+                "wf-recorder directly with its own -o/-g options."
+            )
         command = ["wf-recorder", "-f", str(output)]
+        if self.region:
+            x, y, width, height = self.region
+            command += ["-g", f"{x},{y} {width}x{height}"]
         if self.want_audio:
-            command.append(f"--audio={default_monitor_source()}")
+            command.append(f"--audio={self.audio_device or default_monitor_source()}")
         return command

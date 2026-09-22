@@ -61,3 +61,50 @@ def test_monitor_source_falls_back_when_pactl_is_missing(monkeypatch):
     monkeypatch.undo()  # drop the stub, exercise the real function
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError))
     assert linux.default_monitor_source() == "default"
+
+
+MONITORS = """Monitors: 2
+ 0: +*eDP-1 1920/344x1080/193+0+0  eDP-1
+ 1: +HDMI-1 2560/521x1440/293+1920+0  HDMI-1
+"""
+
+
+def test_parses_xrandr_including_negative_offsets(monkeypatch):
+    monkeypatch.setattr(linux, "_read", lambda cmd: MONITORS)
+    assert linux.list_monitors() == [(0, 0, 1920, 1080), (1920, 0, 2560, 1440)]
+
+
+def test_display_becomes_a_grab_offset_on_the_display_string(monkeypatch, tmp_path):
+    monkeypatch.setattr(linux, "list_monitors", lambda: [(0, 0, 1920, 1080), (1920, 0, 2560, 1440)])
+    monkeypatch.setenv("DISPLAY", ":0")
+    command = LinuxX11Backend(tmp_path / "o.mp4", display=1, audio=False).video_input_args()
+    assert command[-1] == ":0+1920,0"
+    assert command[command.index("-video_size") + 1] == "2560x1440"
+
+
+def test_window_uses_window_id_and_not_a_size(monkeypatch, tmp_path):
+    monkeypatch.setattr(linux, "list_windows", lambda: [("0x03400003", "Firefox — docs")])
+    command = LinuxX11Backend(tmp_path / "o.mp4", window="firefox", audio=False).video_input_args()
+    assert command[command.index("-window_id") + 1] == "0x03400003"
+    assert "-video_size" not in command
+
+
+def test_unmatched_window_title_is_reported(monkeypatch, tmp_path):
+    monkeypatch.setattr(linux, "list_windows", lambda: [("0x1", "Firefox")])
+    monkeypatch.setattr(linux.shutil, "which", lambda name: "/usr/bin/wmctrl")
+    with pytest.raises(RuntimeError, match="No window matching"):
+        LinuxX11Backend(tmp_path / "o.mp4", window="gimp", audio=False).video_input_args()
+
+
+def test_wayland_supports_region_but_not_display_or_window(monkeypatch, tmp_path):
+    monkeypatch.setattr(linux.shutil, "which", lambda name: f"/usr/bin/{name}")
+    cropped = LinuxWaylandBackend(tmp_path / "o.mp4", region=(10, 20, 800, 600), audio=False)
+    assert "-g" in cropped.capture_command(tmp_path / "s.mkv")
+    for unsupported in ({"display": 0}, {"window": "Firefox"}):
+        with pytest.raises(RuntimeError, match="not supported on Wayland"):
+            LinuxWaylandBackend(tmp_path / "o.mp4", **unsupported).capture_command(tmp_path / "s.mkv")
+
+
+def test_audio_device_overrides_the_default_monitor(tmp_path):
+    command = LinuxX11Backend(tmp_path / "o.mp4", audio_device="alsa_output.pci.monitor").audio_input_args()
+    assert command[-1] == "alsa_output.pci.monitor"

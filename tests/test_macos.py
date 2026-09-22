@@ -91,3 +91,34 @@ def test_parser_matches_this_ffmpeg_builds_real_output():
     assert not any("indev" in name for name in {**video, **audio}.values()), (
         "the log prefix leaked into a device name"
     )
+
+
+def test_display_maps_past_the_camera_to_the_right_screen(listed, monkeypatch, tmp_path):
+    monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
+    # video devices are camera=0, screens at 1 and 2, so --display 1 is device 2
+    command = MacBackend(tmp_path / "o.mp4", display=1).video_input_args()
+    assert command[-1] == "2:none"
+
+
+def test_out_of_range_display_is_reported(listed, monkeypatch, tmp_path):
+    monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
+    with pytest.raises(RuntimeError, match="exposes 2"):
+        MacBackend(tmp_path / "o.mp4", display=5).video_input_args()
+
+
+def test_window_capture_is_refused_with_a_way_forward(listed, tmp_path):
+    with pytest.raises(RuntimeError, match="--region"):
+        MacBackend(tmp_path / "o.mp4", window="Safari").video_input_args()
+
+
+def test_region_becomes_a_crop_filter(listed, monkeypatch, tmp_path):
+    monkeypatch.setattr(macos, "screen_recording_permitted", lambda: True)
+    command = MacBackend(tmp_path / "o.mp4", region=(10, 20, 800, 600)).capture_command(tmp_path / "s.mkv")
+    assert "crop=800:600:10:20" in command[command.index("-vf") + 1]
+
+
+def test_named_audio_device_is_selected(listed, monkeypatch, tmp_path):
+    backend = MacBackend(tmp_path / "o.mp4", audio_device="built-in")
+    assert backend.audio_input_args()[-1] == "none:0"
+    with pytest.raises(RuntimeError, match="No audio device matching"):
+        MacBackend(tmp_path / "o.mp4", audio_device="nonexistent").audio_input_args()

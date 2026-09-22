@@ -8,13 +8,14 @@ import shutil
 import time
 from importlib.metadata import version as _pkg_version
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from .capture import get_backend
+from .capture import get_backend, list_sources, parse_region
 
 app = typer.Typer(help="Cross-platform screen recorder built on mpv.", no_args_is_help=True)
 console = Console()
@@ -41,6 +42,15 @@ def install_hint(tool: str, system: str | None = None) -> str:
     """Install command for `tool` on `system`, or a generic nudge on unknown platforms."""
     hints = INSTALL_HINTS.get(system or platform.system(), {})
     return hints.get(tool, f"install {tool} with your package manager")
+
+
+class Quality(str, Enum):
+    low = "low"
+    balanced = "balanced"
+    high = "high"
+
+
+SELECT_WITH = {"display": "--display", "window": "--window", "audio": "--audio-device"}
 
 
 def _version_callback(value: bool) -> None:
@@ -104,13 +114,31 @@ def record(
     fps: int = typer.Option(30, "--fps", help="Capture framerate."),
     audio: bool = typer.Option(True, "--audio/--no-audio", help="Capture system audio."),
     duration: float = typer.Option(0, "-d", "--duration", help="Stop after N seconds (0 = until Ctrl+C)."),
+    quality: Quality = typer.Option(Quality.balanced, "-q", "--quality", help="Encoding quality."),
+    display: int = typer.Option(None, "--display", help="Record one monitor (see `sources`)."),
+    window: str = typer.Option(None, "--window", help="Record one window by title (see `sources`)."),
+    region: str = typer.Option(None, "--region", help="Record an area, as x,y,WIDTHxHEIGHT."),
+    audio_device: str = typer.Option(None, "--audio-device", help="Audio source to record (see `sources`)."),
     audio_offset: float = typer.Option(0.0, "--audio-offset", help="Shift audio by N seconds if it drifts on your machine."),
 ) -> None:
     """Record the screen."""
     if output is None:
         output = Path(f"recording-{datetime.now():%Y%m%d-%H%M%S}.mp4")
+    if sum(x is not None for x in (display, window, region)) > 1:
+        console.print("[red]Pick only one of --display, --window and --region.[/]")
+        raise typer.Exit(1)
     try:
-        backend = get_backend(output, fps=fps, audio=audio, audio_offset=audio_offset)
+        area = parse_region(region) if region else None
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    try:
+        backend = get_backend(
+            output, fps=fps, audio=audio, audio_offset=audio_offset,
+            quality=quality.value, display=display, window=window,
+            region=area, audio_device=audio_device,
+        )
     except NotImplementedError as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(1)
@@ -140,3 +168,31 @@ def record(
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(1)
+
+
+@app.command()
+def sources() -> None:
+    """List the displays, windows and audio devices available to record."""
+    try:
+        found = list_sources()
+    except NotImplementedError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    if not found:
+        console.print("[yellow]No sources found. Is ffmpeg installed? Try `doctor`.[/]")
+        raise typer.Exit(1)
+
+    table = Table(title="Recordable sources")
+    table.add_column("kind")
+    table.add_column("select with")
+    table.add_column("details")
+    for kind in ("display", "window", "audio"):
+        for source in (s for s in found if s.kind == kind):
+            flag = (
+                f"--display {source.id}" if kind == "display"
+                else f'{SELECT_WITH[kind]} "{source.id}"'
+            )
+            # The label only earns a column when it says more than the id does.
+            table.add_row(kind, flag, source.name if source.name != source.id else "")
+    console.print(table)

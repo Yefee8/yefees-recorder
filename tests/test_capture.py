@@ -60,3 +60,35 @@ def test_start_twice_is_an_error(tmp_path):
             backend.start()
     finally:
         backend.stop()
+
+
+class TestRegionAndQuality:
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("0,0,1920x1080", (0, 0, 1920, 1080)),
+            (" 10 , 20 , 800 x 600 ", (10, 20, 800, 600)),
+            ("-1920,0,1920x1080", (-1920, 0, 1920, 1080)),  # monitor left of primary
+        ],
+    )
+    def test_parses_regions(self, text, expected):
+        from yefees_recorder.capture import parse_region
+
+        assert parse_region(text) == expected
+
+    @pytest.mark.parametrize("text", ["", "1,2,3", "0,0,0x100", "0,0,100x0", "a,b,cxd", "0,0,100*100"])
+    def test_rejects_malformed_regions(self, text):
+        from yefees_recorder.capture import parse_region
+
+        with pytest.raises(ValueError):
+            parse_region(text)
+
+    def test_quality_sets_preset_and_crf(self, tmp_path):
+        low = FakeBackend(tmp_path / "o.mp4", quality="low")
+        high = FakeBackend(tmp_path / "o.mp4", quality="high")
+        assert low.crf > high.crf, "lower quality must mean a higher crf"
+        assert "-crf" in low.capture_command(tmp_path / "s.mkv")
+
+    def test_unknown_quality_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="unknown quality"):
+            FakeBackend(tmp_path / "o.mp4", quality="cinematic")

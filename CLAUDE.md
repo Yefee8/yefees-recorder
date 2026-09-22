@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Phase 1 (all three backends), phase 5 (CI matrix) and phase 6 (release plumbing) are done. Phases 2, 3 and 4 (source/quality selection, config file, hotkeys) are not started. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
+Phases 1 (backends), 2 (source and quality selection), 5 (CI matrix) and 6 (release plumbing) are done. Phases 3 and 4 (config file, hotkeys) are not started. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
 
 Verification status per platform:
 
@@ -69,6 +69,26 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 - **Device indices are discovered, never hardcoded** — `-list_devices` writes to stderr and exits non-zero by design, so the exit code is ignored and stderr is parsed. The camera is usually index 0 and the screen 1, and the microphone sits at audio 0 ahead of the loopback device, so picking index 0 gets you a webcam and a mic.
 - **Wayland source selection cannot be automated** — the `xdg-desktop-portal` dialog is an OS security boundary and the user must pick the screen/window there.
 - Backend selection is `platform.system()` plus `XDG_SESSION_TYPE` on Linux, in `get_backend()`.
+
+## Source selection
+
+`--display`, `--window` and `--region` are mutually exclusive and resolve very differently per platform, which is why each backend does its own thing rather than sharing a region helper:
+
+| | display | window | region |
+|---|---|---|---|
+| Windows | `-offset_x/-offset_y/-video_size` from `EnumDisplayMonitors` | native `-i title=...` | same offset args |
+| Linux X11 | offset appended to `DISPLAY` as `:0+x,y` | `-window_id` from `wmctrl` | same |
+| Linux Wayland | unsupported | unsupported | `wf-recorder -g` |
+| macOS | a different avfoundation device | **impossible** | `crop` filter after capture |
+
+Things that bite here:
+
+- **Windows window enumeration must skip DWM-cloaked windows.** Suspended UWP apps (Settings, Movies & TV) stay `IsWindowVisible`, so without the `DWMWA_CLOAKED` check the picker fills with duplicate entries for apps that aren't on screen — measured: 18 raw windows down to 11 real ones.
+- **avfoundation video index 0 is usually a webcam and audio index 0 a microphone.** `--display N` counts screens, not devices, and is mapped through `screen_device_indices()`.
+- **Monitor offsets can be negative** on both Windows and X11 when a monitor sits left of or above the primary, so `parse_region` and the xrandr regex both accept a leading `-`.
+- **`--window` with x11grab must not also pass `-video_size`** — the window's own size wins.
+
+Quality is `low`/`balanced`/`high` mapping to an x264 preset plus CRF. Even `high` stays at `medium` rather than a slow preset: capture is realtime, and dropping frames costs more than bitrate does. Measured on 4s of 1920x1080: 127 / 278 / 323 KiB.
 
 ## CI
 

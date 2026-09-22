@@ -23,10 +23,30 @@ sudo apt install ffmpeg        # Debian/Ubuntu
 
 ```
 yefees-recorder doctor                  # check ffmpeg is installed
+yefees-recorder sources                 # list displays, windows and audio devices
 yefees-recorder record                  # record until Ctrl+C
 yefees-recorder record -d 30 -o clip.mp4
 yefees-recorder record --no-audio --fps 60
 ```
+
+### Choosing what to record
+
+`sources` prints the exact flag for each thing it finds:
+
+```
+yefees-recorder record --display 1                   # one monitor
+yefees-recorder record --window "Firefox"            # one window
+yefees-recorder record --region 0,0,1280x720         # an area, as x,y,WIDTHxHEIGHT
+yefees-recorder record --audio-device "Speakers"     # a specific audio source
+yefees-recorder record -q high                       # low | balanced | high
+```
+
+Recording the whole desktop is the default, which on a multi-monitor machine
+means every monitor side by side — use `--display` for just one.
+
+Window capture is not available everywhere: Windows does it natively, X11 needs
+`wmctrl` installed, and macOS cannot do it at all (avfoundation only exposes
+whole screens, so use `--region` there).
 
 If audio ends up slightly ahead of or behind the video on your machine, nudge it
 with `--audio-offset 0.2`.
