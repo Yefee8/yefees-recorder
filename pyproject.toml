@@ -3,6 +3,20 @@ name = "yefees-recorder"
 version = "0.1.0"
 description = "Cross-platform screen recorder CLI built on mpv"
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+keywords = ["screen-recording", "screencast", "ffmpeg", "cli"]
+classifiers = [
+    # No "License ::" classifier: PEP 639 forbids pairing one with a license expression.
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Multimedia :: Video :: Capture",
+]
 authors = [
     { name = "yefee8", email = "yavuzefefindikli8@gmail.com" }
 ]

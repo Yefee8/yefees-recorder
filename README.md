@@ -48,3 +48,10 @@ uv sync
 uv run yefees-recorder --help
 uv run pytest
 ```
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+ffmpeg is invoked as an external program and is not bundled or linked, so its
+own licensing is independent of this package's.

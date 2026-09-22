@@ -1,0 +1,40 @@
+name: Release
+
+# Tagging is the trigger: `git tag v0.1.0 && git push --tags` publishes to PyPI
+# and opens the GitHub Release. Nothing here needs an API token — PyPI trusts
+# this workflow through OIDC, configured as a Trusted Publisher on the project.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # create the GitHub Release
+  id-token: write  # mint the OIDC token PyPI checks
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # Publishing 0.1.0 from a v0.2.0 tag is unrecoverable: PyPI never lets a
+      # version be reused. Check before building, not after.
+      - name: Tag must match the version in pyproject.toml
+        run: |
+          version="$(uv version --short)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version v$version"
+            exit 1
+          fi
+
+      - run: uv build
+
+      - run: uv publish --trusted-publishing always
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

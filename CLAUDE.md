@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Phase 1 (all three backends) and phase 5 (CI matrix) are done. Phases 2, 3, 4 and 6 (source/quality selection, config file, hotkeys, release) are not started.
+Phase 1 (all three backends), phase 5 (CI matrix) and phase 6 (release plumbing) are done. Phases 2, 3 and 4 (source/quality selection, config file, hotkeys) are not started. Nothing has been pushed to a remote yet and nothing has been published — no release has ever run.
 
 Verification status per platform:
 
@@ -78,6 +78,20 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 - **The Linux job runs pytest under `xvfb-run`.** That `DISPLAY` is the entire reason `tests/test_linux_capture.py` executes rather than skipping — it paints the root window red with `xsetroot` and asserts the captured frames are actually red, because a recorder failure here yields a valid file full of black frames, not an error.
 - **The macOS `doctor` step is allowed to fail.** A hosted runner cannot be granted Screen Recording permission, so `doctor` correctly exits non-zero there. Don't "fix" that by weakening `doctor`.
 - `uv sync --locked` fails the build if `pyproject.toml` changed without relocking.
+
+## Releasing
+
+`.github/workflows/release.yml` fires on a `v*` tag: it checks the tag against `uv version`, builds, publishes to PyPI over OIDC (no API token anywhere), then opens a GitHub Release.
+
+**Three things must be set up before the first tag, or it will fail:**
+
+1. A **pending** Trusted Publisher on PyPI (pypi.org > Your projects > Publishing). It must be "pending" because the project does not exist on PyPI yet — a normal trusted publisher can only be added to a project that already has a release. Fill in repo owner, repo name, workflow `release.yml`, environment `pypi`.
+2. A GitHub environment named **`pypi`**, matching the `environment:` in the workflow.
+3. `project.urls` in `pyproject.toml` — deliberately left out because the repo has no remote yet, so any URL would be a guess.
+
+The name `yefees-recorder` was free on PyPI as of the phase 6 commit.
+
+The version lives only in `pyproject.toml`; `--version` reads it back through `importlib.metadata`, so there is no second copy to keep in sync. The license is declared as a PEP 639 expression, which means **adding a `License ::` classifier would be an error** — PyPI rejects a classifier paired with a license expression.
 
 ## Working style for this repo
 
