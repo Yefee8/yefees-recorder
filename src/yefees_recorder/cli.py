@@ -18,7 +18,7 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from . import config as user_config
-from . import editor, keys, menu
+from . import editor, keys, menu, shutdown
 from .capture import get_backend, list_sources, parse_region
 
 app = typer.Typer(help="Cross-platform screen recorder built on mpv.", no_args_is_help=True)
@@ -244,14 +244,19 @@ def record(
     else:
         console.print("[green]Recording[/] - press Ctrl+C to stop.")
 
-    _run_until_stopped(backend, duration)
+    # Closing the terminal must finish the file the same way Ctrl+C does, so
+    # both paths go through one callback that can only run once.
+    outcome: dict = {}
+    finish = shutdown.install(lambda: _finish(backend, outcome))
 
+    _run_until_stopped(backend, duration)
     console.print("Finishing up...")
-    try:
-        console.print(f"[green]Saved[/] {backend.stop()}")
-    except RuntimeError as exc:
-        console.print(f"[red]{exc}[/]")
+    finish()
+
+    if "error" in outcome:
+        console.print(f"[red]{outcome['error']}[/]")
         raise typer.Exit(1)
+    console.print(f"[green]Saved[/] {outcome['path']}")
 
 
 PAUSE_KEYS = ("p", "P", " ")
@@ -286,6 +291,14 @@ def _watch_for_keys(backend, deadline: float | None) -> None:
             paused = _toggle_pause(backend, paused)
         elif key in STOP_KEYS:
             return
+
+
+def _finish(backend, outcome: dict) -> None:
+    """Finalise the recording, recording the result for whoever asks after."""
+    try:
+        outcome["path"] = backend.stop()
+    except (RuntimeError, OSError) as exc:
+        outcome["error"] = exc
 
 
 def _run_until_stopped(backend, duration: float) -> None:

@@ -49,8 +49,13 @@ yefees-recorder record --pick                        # choose from a menu instea
 ### While recording
 
 Press **p** (or space) to pause and resume, **q** to stop. Ctrl+C also stops
-cleanly. Paused time is cut out of the finished file rather than appearing as a
-frozen frame.
+cleanly, and so does closing the terminal window, logging out or shutting down:
+the recording is finalised rather than left truncated. Paused time is cut out of
+the finished file rather than appearing as a frozen frame.
+
+The one way to lose a recording is killing the process outright (Task Manager's
+End Task, `kill -9`); the operating system gives no program a chance to react to
+that.
 
 ### Audio
 

@@ -105,6 +105,15 @@ Quality is `low`/`balanced`/`high` mapping to an x264 preset plus CRF. Even `hig
 
 Phase 4 also asked for shell completion. Typer already provides `--install-completion` and `--show-completion`, so that needed no code.
 
+## Surviving an abrupt exit
+
+`shutdown.py` exists because **closing a console window produces no signal on Windows** — Python cannot see it, so nothing in an `except` block will catch it. It needs `SetConsoleCtrlHandler` through ctypes, and the callback object must be kept alive in `_HANDLERS` or the process crashes when Windows calls a collected object. POSIX gets SIGHUP and SIGTERM through the normal signal machinery.
+
+- Everything funnels into one `once()`-wrapped callback, because the signal handler runs on **its own thread** and can race the normal end of a recording. `CaptureBackend.stop()` is idempotent for the same reason and returns the same path twice.
+- The console handler returns false for Ctrl+C and Ctrl+Break so they keep their existing path, and true only for close/logoff/shutdown.
+- **Windows kills the process a few seconds after the close handler returns**, so the work there has to stay short: tell ffmpeg to stop and let it close its own file.
+- Measured end to end: CTRL_BREAK to a running recording exits 0 with a playable 5.86s file; `TerminateProcess` leaves no file at all. Nothing can be done about the latter — it is the OS killing the process, same as SIGKILL.
+
 ## Config and precedence
 
 `config.py` resolves **flag > config file > built-in default**. The mechanism that makes this work: every overridable `typer.Option` in `record` defaults to `None`, because otherwise there is no way to tell `--fps 30` from "the user said nothing". If you add a setting, it needs a `None` default, an entry in `DEFAULTS`, and an entry in `TYPES`.

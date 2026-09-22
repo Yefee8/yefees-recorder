@@ -127,6 +127,7 @@ class CaptureBackend(ABC):
         self._segments: list[tuple[Path, Path | None]] = []
         self._proc: subprocess.Popen | None = None
         self._audio = None
+        self._finished: Path | None = None
 
     # How to ask the capture process to finish. None means ffmpeg: write "q" to
     # its stdin. Anything else is a signal number to send instead.
@@ -227,6 +228,13 @@ class CaptureBackend(ABC):
         self._start_segment()
 
     def stop(self) -> Path:
+        """Finish the recording. Safe to call twice; the second call is a no-op.
+
+        An abrupt exit and the normal end of a recording both land here, and
+        they can race, so the finished path is remembered rather than redone.
+        """
+        if self._finished is not None:
+            return self._finished
         self._end_segment()
         self.teardown()
         parts = [
@@ -239,6 +247,7 @@ class CaptureBackend(ABC):
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self._concat(parts)
         self._tmpdir.cleanup()
+        self._finished = self.output
         return self.output
 
     def _start_segment(self) -> None:
