@@ -25,6 +25,10 @@ else:
     import termios
     import tty
 
+# How often to look for a keypress on Windows, where there is nothing to block
+# on. Small enough not to be felt, large enough not to spin a core.
+POLL_SECONDS = 0.003
+
 UP, DOWN, LEFT, RIGHT = "up", "down", "left", "right"
 ENTER, ESC, BACKSPACE = "enter", "esc", "backspace"
 NAMED = {UP, DOWN, LEFT, RIGHT, ENTER, ESC, BACKSPACE}
@@ -82,7 +86,9 @@ def _read_windows(timeout: float) -> str | None:
             return _normalise(char)
         if time.monotonic() >= deadline:
             return None
-        time.sleep(0.02)  # polling, but idle — kbhit() does not block
+        # Windows sleeps overshoot badly - asking for 20 ms measures ~62 ms -
+        # and that lag is what makes a held arrow key feel like it is dragging.
+        time.sleep(POLL_SECONDS)
 
 
 def _read_posix(timeout: float) -> str | None:

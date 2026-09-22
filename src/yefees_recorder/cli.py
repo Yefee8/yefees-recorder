@@ -253,33 +253,51 @@ def record(
         raise typer.Exit(1)
 
 
+PAUSE_KEYS = ("p", "P", " ")
+STOP_KEYS = ("q", "Q", keys.ESC)
+
+
+def _toggle_pause(backend, paused: bool) -> bool:
+    """Pause or resume, and report it. Returns the state actually reached.
+
+    A backend that refuses the change must not end the recording, so the old
+    state is kept rather than raising.
+    """
+    try:
+        backend.resume() if paused else backend.pause()
+    except RuntimeError as exc:
+        console.print(f"[yellow]{exc}[/]")
+        return paused
+
+    if paused:
+        console.print("[green]Resumed.[/]")
+    else:
+        console.print("[yellow]Paused[/] - press p to resume.")
+    return not paused
+
+
+def _watch_for_keys(backend, deadline: float | None) -> None:
+    """Handle pause and stop keys until one stops us, or the deadline passes."""
+    paused = False
+    while deadline is None or time.monotonic() < deadline:
+        key = keys.read_key(0.2)
+        if key in PAUSE_KEYS:
+            paused = _toggle_pause(backend, paused)
+        elif key in STOP_KEYS:
+            return
+
+
 def _run_until_stopped(backend, duration: float) -> None:
     """Block until the user stops the recording, or `duration` runs out.
 
     Keys are read one at a time so pause and stop respond immediately without
-    the user pressing Enter. Ctrl+C keeps working throughout.
+    the user pressing Enter. Ctrl+C keeps working throughout, and is swallowed
+    so the recording still gets finalised.
     """
     deadline = time.monotonic() + duration if duration > 0 else None
-    paused = False
     try:
         with keys.raw_mode():
-            while deadline is None or time.monotonic() < deadline:
-                key = keys.read_key(0.2)
-                if key is None:
-                    continue
-                if key in ("p", "P", " "):
-                    try:
-                        if paused:
-                            backend.resume()
-                            console.print("[green]Resumed.[/]")
-                        else:
-                            backend.pause()
-                            console.print("[yellow]Paused[/] - press p to resume.")
-                        paused = not paused
-                    except RuntimeError as exc:
-                        console.print(f"[yellow]{exc}[/]")
-                elif key in ("q", "Q", keys.ESC):
-                    return
+            _watch_for_keys(backend, deadline)
     except KeyboardInterrupt:
         pass
 

@@ -121,6 +121,15 @@ Presets are `[presets.NAME]` tables in the same file, merged over the top-level 
 
 ## Menus and terminal encoding
 
+### How a page is built
+
+Every page is a **view** (state to something rich can draw) plus a **handler** (one keypress folded into new state), run by the single loop in `Screen._run`. The editor mirrors that split: `_video_items` / `_audio_items` / `_output_items` describe a page, `_edit_audio` / `_edit_output` act on a choice. Adding a setting means touching one list and one dispatch, not growing an if/elif ladder.
+
+- **The loop drains buffered keys before redrawing.** Holding an arrow otherwise queues one repaint per repeat and the highlight visibly trails the keyboard; measured, 41 buffered presses now cost 1 redraw rather than 41.
+- **`keys.POLL_SECONDS` is 3 ms, not 20.** Windows sleeps overshoot badly — asking for 20 ms measures ~62 ms — and that was the bulk of the input lag.
+- Colour is carried by `Item.tone` ("good", "warn", "info", "loud", "muted") so pages say what a value *means* and `TONES` decides how it looks. A gain above 4x reports as "loud" (red) because that is where clipping starts.
+- Block nesting is kept to 3 levels; `scratchpad`-style checks aside, the two functions that exceeded it (`_run_until_stopped`, `Screen._run`) were split rather than left deep.
+
 `menu.py` draws arrow-key menus with `rich.live`; `keys.py` decodes the arrows (two values after a `\x00`/`\xe0` prefix on Windows, `ESC [ A..D` elsewhere). No dependency was added for this.
 
 **Everything rendered inside `rich.live` must go through `menu.safe()`.** A legacy Windows console runs on cp1252 and `rich.live` *raises* `UnicodeEncodeError` rather than substituting, which takes the whole menu down. This is not hypothetical twice over: the pointer glyph crashed it on first render, and window titles are other people's data — on a Turkish desktop they routinely contain characters cp1252 cannot encode. `menu.FANCY` decides whether the nicer glyphs are usable at all, and `safe()` replaces anything unrepresentable.
