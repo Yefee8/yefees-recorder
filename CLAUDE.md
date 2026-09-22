@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Phases 1 (backends), 2 (source and quality selection), 3 (config file and menu), 5 (CI matrix) and 6 (release plumbing) are done. Only phase 4 (hotkeys) is left. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
+All six phases of `plan.md` are implemented. Nothing has been pushed or published yet. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
 
 Verification status per platform:
 
@@ -90,6 +90,17 @@ Things that bite here:
 
 Quality is `low`/`balanced`/`high` mapping to an x264 preset plus CRF. Even `high` stays at `medium` rather than a slow preset: capture is realtime, and dropping frames costs more than bitrate does. Measured on 4s of 1920x1080: 127 / 278 / 323 KiB.
 
+## Hotkeys
+
+**`blessed` is deliberately not a dependency, despite `plan.md` naming it.** Measured on Windows: `Terminal.inkey(timeout=0.5)` returns an empty key after 0.00s and ignores the timeout entirely, including for piped input — `cbreak()` silently degrades to a no-op because there is no `termios`. A wait loop built on it would spin at full CPU and never see a keypress. `keys.py` uses `msvcrt.kbhit`/`getwch` on Windows and `termios`/`tty`/`select` elsewhere, which is roughly the same amount of code with no dependency.
+
+- `read_key` **must** honour its timeout — there is a test asserting it, because that is exactly what blessed got wrong.
+- `raw_mode()` is a no-op on Windows (the console is already unbuffered) and restores termios through a `finally` elsewhere.
+- Ctrl+C still works: `tty.setcbreak` leaves signal handling on, unlike raw mode.
+- `_run_until_stopped` swallows `KeyboardInterrupt` so the file still gets finalised, and catches `RuntimeError` from pause/resume so a refused toggle cannot kill a recording in progress.
+
+Phase 4 also asked for shell completion. Typer already provides `--install-completion` and `--show-completion`, so that needed no code.
+
 ## Config and precedence
 
 `config.py` resolves **flag > config file > built-in default**. The mechanism that makes this work: every overridable `typer.Option` in `record` defaults to `None`, because otherwise there is no way to tell `--fps 30` from "the user said nothing". If you add a setting, it needs a `None` default, an entry in `DEFAULTS`, and an entry in `TYPES`.
@@ -99,6 +110,8 @@ Quality is `low`/`balanced`/`high` mapping to an x264 preset plus CRF. Even `hig
 - **A bad config never stops a recording** — offending keys are dropped, reported as warnings, and the defaults take over.
 - `--init` writes a fixed commented template rather than serialising parsed data, which avoids needing a TOML *writer* and cannot eat the user's comments. A test parses that template back to prove it is valid TOML and that everything in it is commented out.
 - `$YEFEES_RECORDER_CONFIG` overrides the path; the tests rely on it, so don't remove it.
+
+Presets are `[presets.NAME]` tables in the same file, merged over the top-level settings and still beaten by flags. `append_preset` appends text rather than re-serialising the parsed document, so hand-written comments survive — there is a test for that, and one for round-tripping values needing TOML escaping (Windows paths, embedded quotes). It refuses to shadow an existing preset, which would be a duplicate-table parse error anyway.
 
 `--pick` shows a `rich` menu of displays and windows (never audio) and returns a `(display, window)` pair. It refuses to run without a TTY and refuses to combine with an explicit `--display/--window/--region`.
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -30,6 +30,8 @@ DEFAULTS: dict[str, Any] = {
     "audio_offset": 0.0,
     "audio_device": None,
     "display": None,
+    "window": None,
+    "region": None,
 }
 
 # bool before int on purpose: in Python bool is a subclass of int, so checking
@@ -42,6 +44,8 @@ TYPES: dict[str, Any] = {
     "audio_offset": (int, float),
     "audio_device": str,
     "display": int,
+    "window": str,
+    "region": str,
 }
 
 TEMPLATE = """\
@@ -60,7 +64,46 @@ TEMPLATE = """\
 # audio_offset = 0.0          # seconds; raise if audio runs early
 
 # display = 0   # record one monitor by default
+# window = "Firefox"
+# region = "0,0,1280x720"
+
+# Named sets of settings, used with: yefees-recorder record --preset gameplay
+# Save the flags you just used with: record ... --save-preset gameplay
+# [presets.gameplay]
+# display = 1
+# fps = 60
+# quality = "high"
 """
+
+
+class Loaded(NamedTuple):
+    values: dict[str, Any]
+    presets: dict[str, dict[str, Any]]
+    warnings: list[str]
+
+
+def _validate(data: dict[str, Any], where: str) -> tuple[dict[str, Any], list[str]]:
+    values, warnings = {}, []
+    for key, value in data.items():
+        if key not in DEFAULTS:
+            warnings.append(f"Unknown setting {key!r} in {where}")
+        elif key == "audio" and not isinstance(value, bool):
+            warnings.append(f"{key!r} should be true or false, not {value!r}")
+        elif not isinstance(value, TYPES[key]) or (key != "audio" and isinstance(value, bool)):
+            warnings.append(f"{key!r} has the wrong type in {where}: {value!r}")
+        else:
+            values[key] = value
+    return values, warnings
+
+
+def _toml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
 
 
 ENV_VAR = "YEFEES_RECORDER_CONFIG"
@@ -74,31 +117,56 @@ def config_path() -> Path:
     return Path(user_config_dir("yefees-recorder", appauthor=False)) / "config.toml"
 
 
-def load(path: Path | None = None) -> tuple[dict[str, Any], list[str]]:
-    """Settings from the config file, plus any complaints about its contents.
+def load(path: Path | None = None) -> Loaded:
+    """Settings and presets from the config file, plus complaints about it.
 
     A broken config never stops a recording: bad values are dropped and
     reported, and the defaults take over.
     """
     path = path or config_path()
     if not path.exists():
-        return {}, []
+        return Loaded({}, {}, [])
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        return {}, [f"Ignoring {path}: {exc}"]
+        return Loaded({}, {}, [f"Ignoring {path}: {exc}"])
 
-    values, warnings = {}, []
-    for key, value in data.items():
-        if key not in DEFAULTS:
-            warnings.append(f"Unknown setting {key!r} in {path}")
-        elif key == "audio" and not isinstance(value, bool):
-            warnings.append(f"{key!r} should be true or false, not {value!r}")
-        elif not isinstance(value, TYPES[key]) or (key != "audio" and isinstance(value, bool)):
-            warnings.append(f"{key!r} has the wrong type in {path}: {value!r}")
-        else:
-            values[key] = value
-    return values, warnings
+    raw_presets = data.pop("presets", {})
+    values, warnings = _validate(data, str(path))
+
+    presets = {}
+    if not isinstance(raw_presets, dict):
+        warnings.append(f"'presets' should be a table of named settings in {path}")
+    else:
+        for name, body in raw_presets.items():
+            if not isinstance(body, dict):
+                warnings.append(f"Preset {name!r} should be a table, e.g. [presets.{name}]")
+                continue
+            presets[name], preset_warnings = _validate(body, f"preset {name!r}")
+            warnings.extend(preset_warnings)
+    return Loaded(values, presets, warnings)
+
+
+def append_preset(name: str, values: dict[str, Any], path: Path | None = None) -> Path:
+    """Add a `[presets.<name>]` block to the config file.
+
+    Appends text rather than rewriting parsed data, so existing comments and
+    formatting survive untouched. Refuses to shadow an existing preset, which
+    duplicate TOML tables would anyway make a parse error.
+    """
+    path = path or config_path()
+    if name in load(path).presets:
+        raise ValueError(f"Preset {name!r} already exists in {path}; edit or remove it first.")
+    if not values:
+        raise ValueError("Nothing to save — pass the options you want the preset to remember.")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else TEMPLATE
+    block = [f"\n[presets.{name}]"]
+    block += [f"{key} = {_toml_scalar(value)}" for key, value in sorted(values.items())]
+    body = "\n".join(block)
+    path.write_text(existing.rstrip("\n") + "\n" + body + "\n", encoding="utf-8")
+    return path
 
 
 def resolve(key: str, flag_value: Any, values: dict[str, Any]) -> Any:

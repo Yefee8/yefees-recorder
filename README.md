@@ -42,6 +42,29 @@ yefees-recorder record -q high                       # low | balanced | high
 yefees-recorder record --pick                        # choose from a menu instead
 ```
 
+### While recording
+
+Press **p** (or space) to pause and resume, **q** to stop. Ctrl+C also stops
+cleanly. Paused time is cut out of the finished file rather than appearing as a
+frozen frame.
+
+### Presets
+
+```
+yefees-recorder record --save-preset gameplay --display 1 --fps 60 -q high
+yefees-recorder record --preset gameplay
+yefees-recorder config                # lists saved presets
+```
+
+Presets are appended to the config file as `[presets.NAME]` blocks, so you can
+also write them by hand. A flag still overrides a preset.
+
+### Shell completion
+
+```
+yefees-recorder --install-completion
+```
+
 Recording the whole desktop is the default, which on a multi-monitor machine
 means every monitor side by side — use `--display` for just one.
 
