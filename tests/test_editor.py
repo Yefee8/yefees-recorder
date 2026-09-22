@@ -114,16 +114,21 @@ class Script:
         self.titles = []
 
     def install(self, monkeypatch):
-        def choose(title, items, **kwargs):
+        def choose(screen, title, items, **kwargs):
             self.titles.append(title)
             return self.answers.pop(0)
 
-        def ask_text(prompt, **kwargs):
+        def ask_text(screen, prompt, **kwargs):
             self.titles.append(prompt)
             return self.answers.pop(0)
 
-        monkeypatch.setattr(editor.menu, "choose", choose)
-        monkeypatch.setattr(editor.menu, "ask_text", ask_text)
+        def slider(screen, title, **kwargs):
+            self.titles.append(title)
+            return self.answers.pop(0)
+
+        monkeypatch.setattr(menu.Screen, "choose", choose)
+        monkeypatch.setattr(menu.Screen, "ask_text", ask_text)
+        monkeypatch.setattr(menu.Screen, "slider", slider)
 
 
 @pytest.fixture
@@ -182,7 +187,7 @@ class TestEditor:
         assert saved["mic_device"] == "Headset Mic"
 
     def test_gain_is_stored_as_a_number(self, config_file, interactive, monkeypatch):
-        Script("audio", "mic_gain", "2.5", CANCELLED, "save").install(monkeypatch)
+        Script("audio", "mic_gain", 2.5, CANCELLED, "save").install(monkeypatch)
         assert editor.run(console) is True
         assert config.load().values == {"mic_gain": 2.5}
         assert config.load().warnings == []
@@ -199,7 +204,7 @@ class TestEditor:
     def test_backing_out_of_a_submenu_keeps_earlier_edits(
         self, config_file, interactive, monkeypatch
     ):
-        Script("output", "fps", "48", CANCELLED, "save").install(monkeypatch)
+        Script("output", "fps", 48.0, CANCELLED, "save").install(monkeypatch)
         assert editor.run(console) is True
         assert config.load().values == {"fps": 48}
 
@@ -208,3 +213,53 @@ class TestEditor:
     ):
         Script("audio", "audio_device", CANCELLED, CANCELLED, "save").install(monkeypatch)
         assert editor.run(console) is False
+
+
+class TestSlider:
+    def make(self, monkeypatch, *presses, **options):
+        press(monkeypatch, *presses)
+        settings = {"value": 1.0, "minimum": 0.0, "maximum": 8.0, "step": 0.1, "coarse": 1.0}
+        settings.update(options)
+        with menu.Screen(console) as screen:
+            return screen.slider("level", **settings)
+
+    def test_right_and_left_move_by_one_step(self, monkeypatch):
+        assert self.make(monkeypatch, keys.RIGHT, keys.RIGHT, keys.ENTER) == 1.2
+        assert self.make(monkeypatch, keys.LEFT, keys.ENTER) == 0.9
+
+    def test_up_and_down_move_by_the_coarse_step(self, monkeypatch):
+        assert self.make(monkeypatch, keys.UP, keys.ENTER) == 2.0
+        assert self.make(monkeypatch, keys.DOWN, keys.ENTER) == 0.0
+
+    def test_repeated_steps_do_not_drift(self, monkeypatch):
+        """Floating point would otherwise land on 1.9000000000000001."""
+        value = self.make(monkeypatch, *([keys.RIGHT] * 9), keys.ENTER)
+        assert value == 1.9
+
+    def test_it_stops_at_the_ends(self, monkeypatch):
+        assert self.make(monkeypatch, *([keys.UP] * 20), keys.ENTER) == 8.0
+        assert self.make(monkeypatch, *([keys.DOWN] * 20), keys.ENTER) == 0.0
+
+    def test_escape_keeps_the_old_value(self, monkeypatch):
+        assert self.make(monkeypatch, keys.RIGHT, keys.ESC) is CANCELLED
+
+    def test_a_starting_value_outside_the_range_is_clamped(self, monkeypatch):
+        assert self.make(monkeypatch, keys.ENTER, value=99.0) == 8.0
+
+    def test_decibels_are_reported_the_way_audio_people_read_them(self):
+        assert menu.as_decibels(1.0) == "unchanged"
+        assert menu.as_decibels(2.0) == "+6.0 dB"
+        assert menu.as_decibels(0.5) == "-6.0 dB"
+        assert menu.as_decibels(0.0) == "silent"
+
+
+def test_the_whole_session_uses_one_screen(config_file, interactive, monkeypatch):
+    """Each page must redraw in place, not print another menu underneath."""
+    opened = []
+    real_enter = menu.Screen.__enter__
+    monkeypatch.setattr(menu.Screen, "__enter__",
+                        lambda self: (opened.append(1), real_enter(self))[1])
+    Script("video", "display", "1", "audio", "mic", CANCELLED, "output", CANCELLED,
+           "save").install(monkeypatch)
+    editor.run(console)
+    assert opened == [1], f"opened {len(opened)} live regions instead of one"

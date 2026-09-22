@@ -1,12 +1,16 @@
-"""Arrow-key menus.
+"""Arrow-key menus drawn in one place on screen.
 
-rich draws the list and `keys` reads the arrows, so there is no dependency
-here beyond what the CLI already uses. Menus redraw in place through
-`rich.live` rather than scrolling the terminal.
+A `Screen` owns a single `rich.live` region for a whole session. Every menu,
+text field and slider redraws *that* region, so moving between pages replaces
+what is on screen instead of printing another block underneath it.
+
+rich draws and `keys` reads, so there is no dependency here beyond what the
+CLI already uses.
 """
 
 from __future__ import annotations
 
+import math
 import sys
 from typing import Any, Callable, NamedTuple
 
@@ -23,7 +27,7 @@ def _encodable(text: str) -> bool:
     """Whether this terminal can print `text` at all.
 
     A legacy Windows console runs on cp1252 and raises UnicodeEncodeError on
-    arrows and pointers, which would crash the menu rather than look plain.
+    arrows and block glyphs, which would crash the menu rather than look plain.
     """
     try:
         text.encode(sys.stdout.encoding or "utf-8")
@@ -32,16 +36,22 @@ def _encodable(text: str) -> bool:
     return True
 
 
-FANCY = _encodable("\u276f\u2191\u2193\u23ce\u2190\u232b")
+FANCY = _encodable("❯↑↓⏎←⌫█░")
 
-CURSOR = "\u276f" if FANCY else ">"
+CURSOR = "❯" if FANCY else ">"
+BAR_FULL = "█" if FANCY else "#"
+BAR_EMPTY = "░" if FANCY else "-"
 HINT_MENU = (
-    "\u2191\u2193 move   \u23ce select   \u2190 back" if FANCY
+    "↑↓ move   ⏎ select   ← back" if FANCY
     else "up/down move   Enter select   Left back"
 )
 HINT_TEXT = (
-    "\u23ce accept   \u232b delete   Esc cancel   (empty = automatic)" if FANCY
+    "⏎ accept   ⌫ delete   Esc cancel   (empty = automatic)" if FANCY
     else "Enter accept   Backspace delete   Esc cancel   (empty = automatic)"
+)
+HINT_SLIDER = (
+    "←→ adjust   ↑↓ bigger steps   ⏎ accept   Esc cancel" if FANCY
+    else "left/right adjust   up/down bigger steps   Enter accept   Esc cancel"
 )
 
 
@@ -69,7 +79,180 @@ class Item(NamedTuple):
     reason: str = ""       # why it is disabled, shown instead of `detail`
 
 
-def _render(title: str, items: list[Item], cursor: int, hint: str) -> Group:
+def as_decibels(gain: float) -> str:
+    """A multiplier described the way audio people read it."""
+    if gain <= 0:
+        return "silent"
+    if abs(gain - 1.0) < 1e-9:
+        return "unchanged"
+    return f"{20 * math.log10(gain):+.1f} dB"
+
+
+class Screen:
+    """One live region that every page of a session redraws."""
+
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self._live: Live | None = None
+
+    def __enter__(self) -> "Screen":
+        # transient: the region is wiped on exit, so whatever is printed
+        # afterwards starts on a clean line instead of under a stale menu.
+        self._live = Live(Text(""), console=self.console, auto_refresh=False, transient=True)
+        self._live.__enter__()
+        return self
+
+    def __exit__(self, *exception) -> None:
+        if self._live is not None:
+            self._live.__exit__(*exception)
+            self._live = None
+
+    @staticmethod
+    def _usable() -> bool:
+        """No terminal means no keys will ever arrive; do not spin waiting."""
+        return keys.interactive()
+
+    def _draw(self, renderable) -> None:
+        if self._live is not None:
+            self._live.update(renderable, refresh=True)
+        else:
+            self.console.print(renderable)
+
+    # ---------------------------------------------------------------- menus
+    def choose(
+        self,
+        title: str,
+        items: list[Item],
+        *,
+        cursor: int = 0,
+        hint: str = "",
+        on_left: bool = True,
+    ) -> Any:
+        """Show `items` and return the chosen value, or CANCELLED.
+
+        Left, Esc and q all back out, which is what makes nested pages feel
+        like one screen rather than a stack of prompts.
+        """
+        if not self._usable():
+            return CANCELLED
+        hint = hint or HINT_MENU
+        usable = [i for i, item in enumerate(items) if item.enabled]
+        if not usable:
+            return CANCELLED
+        cursor = cursor if cursor in usable else usable[0]
+
+        def step(start: int, delta: int) -> int:
+            position = usable.index(start) if start in usable else 0
+            return usable[(position + delta) % len(usable)]
+
+        self._draw(_menu_view(title, items, cursor, hint))
+        with keys.raw_mode():
+            while True:
+                key = keys.read_key(0.3)
+                if key is None:
+                    continue
+                if key == keys.UP:
+                    cursor = step(cursor, -1)
+                elif key == keys.DOWN:
+                    cursor = step(cursor, 1)
+                elif key in (keys.ENTER, keys.RIGHT, " "):
+                    return items[cursor].value
+                elif key in (keys.ESC, "q", "Q") or (on_left and key == keys.LEFT):
+                    return CANCELLED
+                else:
+                    continue
+                self._draw(_menu_view(title, items, cursor, hint))
+
+    # ----------------------------------------------------------- text field
+    def ask_text(
+        self,
+        prompt: str,
+        *,
+        current: str = "",
+        validate: Callable[[str], str | None] | None = None,
+    ) -> Any:
+        """A one-line text field. Returns the text, "" for unset, or CANCELLED."""
+        if not self._usable():
+            return CANCELLED
+        buffer = list(current)
+        error = ""
+
+        self._draw(_text_view(prompt, buffer, error))
+        with keys.raw_mode():
+            while True:
+                key = keys.read_key(0.3)
+                if key is None:
+                    continue
+                if key == keys.ENTER:
+                    text = "".join(buffer).strip()
+                    error = validate(text) if (validate and text) else None
+                    if not error:
+                        return text
+                elif key == keys.ESC:
+                    return CANCELLED
+                elif key == keys.BACKSPACE:
+                    if buffer:
+                        buffer.pop()
+                    error = ""
+                elif key in (keys.LEFT, keys.RIGHT, keys.UP, keys.DOWN):
+                    continue
+                elif len(key) == 1 and key.isprintable():
+                    buffer.append(key)
+                    error = ""
+                self._draw(_text_view(prompt, buffer, error or ""))
+
+    # --------------------------------------------------------------- slider
+    def slider(
+        self,
+        title: str,
+        *,
+        value: float,
+        minimum: float,
+        maximum: float,
+        step: float,
+        coarse: float | None = None,
+        describe: Callable[[float], str] | None = None,
+    ) -> Any:
+        """Adjust a number with the arrow keys. Returns the value or CANCELLED.
+
+        Left and right move by `step`, up and down by `coarse`, so a range wide
+        enough to be useful is still crossable in a few presses.
+        """
+        if not self._usable():
+            return CANCELLED
+        coarse = coarse if coarse is not None else step * 10
+        # Round to the step, or repeated adds drift into 1.9000000000000001.
+        digits = max(0, -math.floor(math.log10(step))) if step < 1 else 0
+        value = min(max(value, minimum), maximum)
+
+        def shift(current: float, amount: float) -> float:
+            return round(min(max(current + amount, minimum), maximum), digits)
+
+        self._draw(_slider_view(title, value, minimum, maximum, describe))
+        with keys.raw_mode():
+            while True:
+                key = keys.read_key(0.3)
+                if key is None:
+                    continue
+                if key == keys.LEFT:
+                    value = shift(value, -step)
+                elif key == keys.RIGHT:
+                    value = shift(value, step)
+                elif key == keys.DOWN:
+                    value = shift(value, -coarse)
+                elif key == keys.UP:
+                    value = shift(value, coarse)
+                elif key == keys.ENTER:
+                    return value
+                elif key in (keys.ESC, "q", "Q"):
+                    return CANCELLED
+                else:
+                    continue
+                self._draw(_slider_view(title, value, minimum, maximum, describe))
+
+
+# ------------------------------------------------------------------- views
+def _menu_view(title: str, items: list[Item], cursor: int, hint: str) -> Group:
     lines: list[Any] = []
     if title:
         lines.append(Text(safe(title), style="bold"))
@@ -92,95 +275,54 @@ def _render(title: str, items: list[Item], cursor: int, hint: str) -> Group:
     return Group(*lines)
 
 
-def choose(
+def _text_view(prompt: str, buffer: list[str], error: str) -> Group:
+    typed = Text()
+    typed.append(safe("  " + prompt + ": "), style="bold")
+    typed.append(safe("".join(buffer)) or " ", style="reverse")
+    rows: list[Any] = [typed, Text("")]
+    if error:
+        rows.append(Text(safe("  " + error), style="red"))
+        rows.append(Text(""))
+    rows.append(Text("  " + HINT_TEXT, style="dim"))
+    return Group(*rows)
+
+
+def _slider_view(
     title: str,
-    items: list[Item],
-    *,
-    console: Console,
-    cursor: int = 0,
-    hint: str = "",
-    on_left: bool = True,
-) -> Any:
-    """Show `items` and return the chosen value, or CANCELLED.
+    value: float,
+    minimum: float,
+    maximum: float,
+    describe: Callable[[float], str] | None,
+    width: int = 28,
+) -> Group:
+    span = maximum - minimum
+    filled = round((value - minimum) / span * width) if span else 0
+    bar = Text()
+    bar.append("  ")
+    bar.append(BAR_FULL * filled, style="cyan")
+    bar.append(BAR_EMPTY * (width - filled), style="dim")
+    bar.append(f"  {value:g}", style="bold")
+    if describe:
+        bar.append(f"   {describe(value)}", style="dim")
 
-    Left arrow, Esc and q all back out, which is what makes nested menus feel
-    like one thing rather than a stack of prompts.
-    """
-    hint = hint or HINT_MENU
-    usable = [i for i, item in enumerate(items) if item.enabled]
-    if not usable:
-        return CANCELLED
-    cursor = cursor if cursor in usable else usable[0]
-
-    def step(start: int, delta: int) -> int:
-        position = usable.index(start) if start in usable else 0
-        return usable[(position + delta) % len(usable)]
-
-    with Live(_render(title, items, cursor, hint), console=console, auto_refresh=False) as live:
-        with keys.raw_mode():
-            while True:
-                key = keys.read_key(0.3)
-                if key is None:
-                    continue
-                if key == keys.UP:
-                    cursor = step(cursor, -1)
-                elif key == keys.DOWN:
-                    cursor = step(cursor, 1)
-                elif key in (keys.ENTER, keys.RIGHT, " "):
-                    return items[cursor].value
-                elif key in (keys.ESC, "q", "Q") or (on_left and key == keys.LEFT):
-                    return CANCELLED
-                else:
-                    continue
-                live.update(_render(title, items, cursor, hint), refresh=True)
+    scale = Text(f"  {minimum:g}" + " " * max(1, width - 6) + f"{maximum:g}", style="dim")
+    return Group(
+        Text(safe(title), style="bold"),
+        Text(""),
+        bar,
+        scale,
+        Text(""),
+        Text("  " + HINT_SLIDER, style="dim"),
+    )
 
 
-def ask_text(
-    prompt: str,
-    *,
-    console: Console,
-    current: str = "",
-    validate: Callable[[str], str | None] | None = None,
-) -> Any:
-    """A one-line text field with the same feel as `choose`.
+# --------------------------------------------- one-off helpers (no session)
+def choose(title: str, items: list[Item], *, console: Console, **options) -> Any:
+    """A single menu outside an editing session, e.g. `record --pick`."""
+    with Screen(console) as screen:
+        return screen.choose(title, items, **options)
 
-    Returns the text (possibly empty, meaning "unset") or CANCELLED. `validate`
-    returns an error message to reject a value, or None to accept it.
-    """
-    buffer = list(current)
-    error = ""
 
-    def view() -> Group:
-        typed = Text()
-        typed.append(safe("  " + prompt + ": "), style="bold")
-        typed.append(safe("".join(buffer)) or " ", style="reverse")
-        rows: list[Any] = [typed, Text("")]
-        if error:
-            rows.append(Text(safe("  " + error), style="red"))
-            rows.append(Text(""))
-        rows.append(Text("  " + HINT_TEXT, style="dim"))
-        return Group(*rows)
-
-    with Live(view(), console=console, auto_refresh=False) as live:
-        with keys.raw_mode():
-            while True:
-                key = keys.read_key(0.3)
-                if key is None:
-                    continue
-                if key == keys.ENTER:
-                    text = "".join(buffer).strip()
-                    error = validate(text) if (validate and text) else None
-                    if not error:
-                        return text
-                elif key == keys.ESC:
-                    return CANCELLED
-                elif key == keys.BACKSPACE:
-                    if buffer:
-                        buffer.pop()
-                    error = ""
-                elif key in (keys.LEFT, keys.RIGHT, keys.UP, keys.DOWN):
-                    continue
-                elif len(key) == 1 and key.isprintable():
-                    buffer.append(key)
-                    error = ""
-                live.update(view(), refresh=True)
+def ask_text(prompt: str, *, console: Console, **options) -> Any:
+    with Screen(console) as screen:
+        return screen.ask_text(prompt, **options)
