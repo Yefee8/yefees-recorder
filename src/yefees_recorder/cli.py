@@ -108,7 +108,7 @@ def doctor() -> None:
             table.add_row(
                 "screen recording", "[red]denied[/]",
                 "System Settings > Privacy & Security > Screen Recording"
-                " (macOS records black frames without it)",
+                " (macOS captures nothing at all without it)",
             )
 
     console.print(table)

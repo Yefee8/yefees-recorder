@@ -6,8 +6,10 @@ friends) that shows up as an *input* ffmpeg can read; without one, we record
 video only rather than failing.
 
 The trap worth knowing: without Screen Recording permission macOS does not
-error, it hands back black frames. So permission is checked up front via
-CoreGraphics instead of being discovered after a ruined recording.
+error. Measured on 14.5, the device opens and then never delivers a frame at
+all, so ffmpeg sits there forever and writes no file - worse than the black
+frames this was once assumed to produce. Permission is therefore checked up
+front via CoreGraphics rather than discovered after a ruined recording.
 """
 
 from __future__ import annotations
@@ -24,9 +26,13 @@ LOOPBACK_DEVICE_HINTS = ("blackhole", "soundflower", "loopback audio", "ishowu",
 
 DEVICE_LINE = re.compile(r"\[(\d+)\]\s+(.+?)\s*$")
 
+# What AVCaptureScreenInput actually hands over. ffmpeg converts it to yuv420p
+# for the encoder; asking the device for yuv420p directly is what it refuses.
+SCREEN_PIXEL_FORMAT = "uyvy422"
+
 PERMISSION_HELP = (
-    "Screen Recording permission has not been granted, so macOS would record "
-    "black frames instead of your screen.\n"
+    "Screen Recording permission has not been granted, so macOS would hand "
+    "ffmpeg no frames at all and the recording would hang instead of failing.\n"
     "Grant it in System Settings > Privacy & Security > Screen Recording, tick the "
     "terminal app you are running this from, then run the command again.\n"
     "(macOS only applies the change to newly launched processes, so restart the "
@@ -178,6 +184,12 @@ class MacBackend(CaptureBackend):
         return [
             "-f", "avfoundation",
             "-framerate", str(self.fps),
+            # The demuxer asks for yuv420p by default, which no screen device
+            # offers, and ffmpeg then prints its fallback at *error* level on
+            # every single recording. Naming the format it would have settled on
+            # keeps the output quiet; measured, it costs nothing (1.30s to the
+            # first frame either way, against 1.39s for nv12).
+            "-pixel_format", SCREEN_PIXEL_FORMAT,
             "-capture_cursor", "1",
             "-i", f"{screen}:none",
         ]
