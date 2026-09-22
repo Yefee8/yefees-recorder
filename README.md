@@ -147,6 +147,15 @@ Video source is a single choice — whole desktop, a monitor, a window or an are
 — because only one of them can be recorded. Picking a window clears the monitor
 and the area automatically.
 
+Audio levels are set in **decibels** on a slider: left and right nudge by
+0.5 dB, up and down by 3 dB, and pressing **t** lets you type an exact value.
+The bar turns yellow past +6 dB and red past +14 dB, where clipping starts.
+Levels are stored as the multiplier ffmpeg needs, so `mic_gain = 2.0` in the
+file and `+6 dB` in the menu are the same thing.
+
+Devices are scanned once when a page first needs them; pick **Rescan** in a
+device list if you plug something in while the menu is open.
+
 Nothing is written until you choose Save, only the settings you changed are
 written, and your comments survive.
 

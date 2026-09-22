@@ -127,7 +127,12 @@ Every page is a **view** (state to something rich can draw) plus a **handler** (
 
 - **The loop drains buffered keys before redrawing.** Holding an arrow otherwise queues one repaint per repeat and the highlight visibly trails the keyboard; measured, 41 buffered presses now cost 1 redraw rather than 41.
 - **`keys.POLL_SECONDS` is 3 ms, not 20.** Windows sleeps overshoot badly — asking for 20 ms measures ~62 ms — and that was the bulk of the input lag.
+- **Devices are enumerated once per editing session** (`editor.Sources`). Scanning costs ~640 ms on Windows, almost all of it starting PyAudio, and the menus ask repeatedly — that was the freeze on first entering a page. `Screen.notice()` says what is happening while it runs, and a **Rescan** row exists because windows and devices come and go while the menu is open.
+- **Gains are edited in decibels and stored as multipliers.** dB is the scale the numbers mean something on; `volume=` wants the multiplier. `menu.gain_to_db` / `db_to_gain` are the only place that conversion lives, and a test round-trips it.
+- Sliders take `thresholds=(caution, danger)` because a dB scale cannot colour itself by "how far along the range" — 0 dB sits past halfway on -40..+24 yet is the neutral value. `_gain_tone` uses the same thresholds so the list and the slider agree.
+- Pressing **t** on a slider opens a text field for a value the steps cannot land on, validated against the slider's own range.
 - Colour is carried by `Item.tone` ("good", "warn", "info", "loud", "muted") so pages say what a value *means* and `TONES` decides how it looks. A gain above 4x reports as "loud" (red) because that is where clipping starts.
+- **Contrast rules:** ordinary text carries *no* colour, so it inherits the terminal foreground and is guaranteed to contrast with whatever background the user has. Accents use the basic ANSI colours, which a terminal theme adjusts to stay readable; 256-colour greys do not adapt and were the reason the first palette read badly. A selected row is styled as one block — cursor, label and detail together — because colouring only part of it leaves the row looking broken.
 - Block nesting is kept to 3 levels; `scratchpad`-style checks aside, the two functions that exceeded it (`_run_until_stopped`, `Screen._run`) were split rather than left deep.
 
 `menu.py` draws arrow-key menus with `rich.live`; `keys.py` decodes the arrows (two values after a `\x00`/`\xe0` prefix on Windows, `ESC [ A..D` elsewhere). No dependency was added for this.

@@ -26,8 +26,10 @@ from .menu import CANCELLED, Item, Screen
 
 SOURCE_KEYS = ("display", "window", "region")
 
-# Levels are multipliers. 8x is +18 dB, past which anything useful has clipped.
-GAIN_RANGE = {"minimum": 0.0, "maximum": 8.0, "step": 0.1, "coarse": 1.0}
+# Gains are adjusted in decibels, which is the scale the numbers mean something
+# on, and stored as the multiplier ffmpeg's volume filter wants.
+GAIN_RANGE = {"minimum": menu.MIN_DB, "maximum": menu.MAX_DB, "step": 0.5, "coarse": 3.0}
+GAIN_WARNING = (6.0, 14.0)   # yellow from +6 dB, red from +14 dB, where clipping bites
 OFFSET_RANGE = {"minimum": -2.0, "maximum": 2.0, "step": 0.05, "coarse": 0.25}
 FPS_RANGE = {"minimum": 5, "maximum": 120, "step": 1, "coarse": 10}
 
@@ -39,11 +41,34 @@ DEVICE_PAGES = {
 
 
 # ----------------------------------------------------------------- labelling
-def _sources_of(kind: str) -> list:
-    try:
-        return [source for source in list_sources() if source.kind == kind]
-    except (NotImplementedError, OSError, RuntimeError):
-        return []
+class Sources:
+    """The machine's devices, looked up once per editing session.
+
+    Enumerating costs about half a second on Windows, mostly spent starting
+    PyAudio, and the menus ask for it repeatedly. Without this the first page
+    that needs a device list simply appears to freeze.
+    """
+
+    def __init__(self) -> None:
+        self._found: list | None = None
+
+    def load(self, screen: Screen) -> None:
+        if self._found is not None:
+            return
+        screen.notice("Scanning devices...")
+        try:
+            self._found = list(list_sources())
+        except (NotImplementedError, OSError, RuntimeError):
+            self._found = []
+
+    def of(self, kind: str, screen: Screen) -> list:
+        self.load(screen)
+        return [source for source in self._found if source.kind == kind]
+
+    def rescan(self, screen: Screen) -> None:
+        """Devices and windows come and go while the menu is open."""
+        self._found = None
+        self.load(screen)
 
 
 def _setting(values: dict, key: str) -> Any:
@@ -63,9 +88,13 @@ def _gain_label(gain: float) -> str:
 
 
 def _gain_tone(gain: float) -> str:
-    """Warn once a gain is high enough to start clipping."""
-    if gain > 4:
+    """Match the colour the slider gives the same level, so the two agree."""
+    caution, danger = GAIN_WARNING
+    decibels = menu.gain_to_db(gain)
+    if decibels >= danger:
         return "loud"
+    if decibels >= caution:
+        return "warn"
     return "info" if gain != 1.0 else "muted"
 
 
@@ -109,27 +138,44 @@ def _store(values: dict, key: str, picked: Any, convert=lambda value: value) -> 
         values[key] = convert(picked)
 
 
-def _pick_device(screen: Screen, kind: str, title: str, current: Any) -> Any:
-    """Choose from the devices this machine actually has, or CANCELLED."""
-    found = _sources_of(kind)
-    if not found:
-        return screen.ask_text(f"{title} (none detected, type a name)", current=str(current or ""))
+RESCAN = object()
 
+
+def _device_items(found: list, current: Any) -> list[Item]:
     items = [Item("Automatic", None, "let the recorder choose")]
     items += [
         Item(source.id, source.id,
              source.name if source.name != source.id else "", tone="info")
         for source in found
     ]
-    cursor = next((n for n, item in enumerate(items) if item.value == current), 0)
-    return screen.choose(title, items, cursor=cursor)
+    items.append(Item("Rescan", RESCAN, "look for devices again", tone="muted"))
+    return items
+
+
+def _pick_device(screen: Screen, sources: Sources, kind: str, title: str, current: Any) -> Any:
+    """Choose from the devices this machine actually has, or CANCELLED."""
+    while True:
+        found = sources.of(kind, screen)
+        if not found:
+            return screen.ask_text(f"{title} (none detected, type a name)",
+                                   current=str(current or ""))
+        items = _device_items(found, current)
+        cursor = next((n for n, item in enumerate(items) if item.value == current), 0)
+        picked = screen.choose(title, items, cursor=cursor)
+        if picked is not RESCAN:
+            return picked
+        sources.rescan(screen)
 
 
 def _pick_gain(screen: Screen, label: str, current: float) -> Any:
-    return screen.slider(
-        f"{label}   (1.0 leaves it alone; microphones usually need more)",
-        value=float(current), describe=menu.as_decibels, **GAIN_RANGE,
+    """Adjust a level in decibels, returning the multiplier to store."""
+    decibels = screen.slider(
+        f"{label}   (0 dB leaves it alone; microphones usually need more)",
+        value=menu.gain_to_db(float(current)),
+        describe=lambda db: f"x{menu.db_to_gain(db):.3g}",
+        unit=" dB", thresholds=GAIN_WARNING, **GAIN_RANGE,
     )
+    return decibels if decibels is CANCELLED else menu.db_to_gain(decibels)
 
 
 # ------------------------------------------------------------- video source
@@ -142,7 +188,7 @@ def _video_items(values: dict) -> list[Item]:
     ]
 
 
-def _choose_video_source(screen: Screen, values: dict, chosen: str) -> bool:
+def _choose_video_source(screen: Screen, sources: Sources, values: dict, chosen: str) -> bool:
     """Apply one video-source choice. Returns True once something was set.
 
     Every branch clears all three keys first: they are mutually exclusive, so
@@ -150,9 +196,9 @@ def _choose_video_source(screen: Screen, values: dict, chosen: str) -> bool:
     """
     picked: Any = None
     if chosen == "display":
-        picked = _pick_device(screen, "display", "Which monitor", values.get("display"))
+        picked = _pick_device(screen, sources, "display", "Which monitor", values.get("display"))
     elif chosen == "window":
-        picked = _pick_device(screen, "window", "Which window", values.get("window"))
+        picked = _pick_device(screen, sources, "window", "Which window", values.get("window"))
     elif chosen == "region":
         picked = screen.ask_text("Area as x,y,WIDTHxHEIGHT",
                                  current=values.get("region") or "", validate=_check_region)
@@ -175,7 +221,7 @@ def _check_region(text: str) -> str | None:
     return None
 
 
-def _video_menu(screen: Screen, values: dict) -> None:
+def _video_menu(screen: Screen, sources: Sources, values: dict) -> None:
     while True:
         chosen = screen.choose(
             f"Video source  -  currently {_describe_source(values)}", _video_items(values),
@@ -183,7 +229,7 @@ def _video_menu(screen: Screen, values: dict) -> None:
         )
         if chosen is CANCELLED:
             return
-        if _choose_video_source(screen, values, chosen):
+        if _choose_video_source(screen, sources, values, chosen):
             return
 
 
@@ -214,12 +260,12 @@ def _audio_items(values: dict, app_available: bool) -> list[Item]:
     ]
 
 
-def _edit_audio(screen: Screen, values: dict, chosen: str) -> None:
+def _edit_audio(screen: Screen, sources: Sources, values: dict, chosen: str) -> None:
     if chosen in ("audio", "mic"):
         values[chosen] = not _setting(values, chosen)
     elif chosen in DEVICE_PAGES:
         kind, title = DEVICE_PAGES[chosen]
-        picked = _pick_device(screen, kind, title, values.get(chosen))
+        picked = _pick_device(screen, sources, kind, title, values.get(chosen))
         _store(values, chosen, picked, convert=lambda name: name or None)
     elif chosen in ("audio_gain", "mic_gain"):
         label = "System audio level" if chosen == "audio_gain" else "Microphone level"
@@ -233,13 +279,13 @@ def _edit_audio(screen: Screen, values: dict, chosen: str) -> None:
         _store(values, "audio_offset", picked)
 
 
-def _audio_menu(screen: Screen, values: dict) -> None:
-    app_available = bool(_sources_of("app"))
+def _audio_menu(screen: Screen, sources: Sources, values: dict) -> None:
+    app_available = bool(sources.of("app", screen))
     while True:
         chosen = screen.choose("Audio", _audio_items(values, app_available))
         if chosen is CANCELLED:
             return
-        _edit_audio(screen, values, chosen)
+        _edit_audio(screen, sources, values, chosen)
 
 
 # ------------------------------------------------------------ output/quality
@@ -273,7 +319,7 @@ def _edit_output(screen: Screen, values: dict, chosen: str) -> None:
         _store(values, "quality", screen.choose("Quality", items, cursor=cursor))
 
 
-def _output_menu(screen: Screen, values: dict) -> None:
+def _output_menu(screen: Screen, sources: Sources, values: dict) -> None:
     while True:
         chosen = screen.choose("Output and quality", _output_items(values))
         if chosen is CANCELLED:
@@ -317,6 +363,7 @@ def _confirm_discard(screen: Screen) -> bool:
 def _session(screen: Screen, path, original: dict) -> dict | None:
     """Run the menus. Returns the changes to write, or None to write nothing."""
     values = dict(original)
+    sources = Sources()
     while True:
         chosen = screen.choose(
             f"Settings  -  {path}", _main_items(values, original),
@@ -324,7 +371,7 @@ def _session(screen: Screen, path, original: dict) -> dict | None:
             on_left=False,
         )
         if chosen in PAGES:
-            PAGES[chosen](screen, values)
+            PAGES[chosen](screen, sources, values)
         elif chosen == "save":
             return _changes_between(original, values)
         elif values == original or _confirm_discard(screen):

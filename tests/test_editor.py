@@ -186,11 +186,21 @@ class TestEditor:
         assert saved["mic"] is True
         assert saved["mic_device"] == "Headset Mic"
 
-    def test_gain_is_stored_as_a_number(self, config_file, interactive, monkeypatch):
-        Script("audio", "mic_gain", 2.5, CANCELLED, "save").install(monkeypatch)
+    def test_gain_is_chosen_in_decibels_and_stored_as_a_multiplier(
+        self, config_file, interactive, monkeypatch
+    ):
+        """The slider works in dB; ffmpeg's volume filter wants the multiplier."""
+        Script("audio", "mic_gain", 6.0, CANCELLED, "save").install(monkeypatch)
         assert editor.run(console) is True
-        assert config.load().values == {"mic_gain": 2.5}
-        assert config.load().warnings == []
+        saved = config.load()
+        assert saved.values["mic_gain"] == pytest.approx(2.0, abs=0.01)
+        assert saved.warnings == []
+
+    def test_a_cancelled_gain_slider_changes_nothing(
+        self, config_file, interactive, monkeypatch
+    ):
+        Script("audio", "mic_gain", CANCELLED, CANCELLED, "save").install(monkeypatch)
+        assert editor.run(console) is False
 
     def test_quitting_writes_nothing(self, config_file, interactive, monkeypatch):
         Script("video", "display", "1", "quit", True).install(monkeypatch)
@@ -263,3 +273,63 @@ def test_the_whole_session_uses_one_screen(config_file, interactive, monkeypatch
            "save").install(monkeypatch)
     editor.run(console)
     assert opened == [1], f"opened {len(opened)} live regions instead of one"
+
+
+class TestSliderTyping:
+    def test_pressing_t_opens_a_field_for_an_exact_value(self, monkeypatch):
+        press(monkeypatch, "t", "3", ".", "7", keys.ENTER, keys.ENTER)
+        with menu.Screen(console) as screen:
+            value = screen.slider("level", value=0.0, minimum=-40.0, maximum=24.0,
+                                  step=0.5, coarse=3.0)
+        assert value == 3.7, "a typed value the steps cannot land on must survive"
+
+    def test_a_typed_value_outside_the_range_is_refused(self, monkeypatch):
+        press(monkeypatch, "t", "9", "9", keys.ENTER,
+              keys.BACKSPACE, keys.BACKSPACE, "5", keys.ENTER, keys.ENTER)
+        with menu.Screen(console) as screen:
+            value = screen.slider("level", value=0.0, minimum=-40.0, maximum=24.0,
+                                  step=0.5, coarse=3.0)
+        assert value == 5.0
+
+    def test_typing_can_be_turned_off(self, monkeypatch):
+        press(monkeypatch, "t", keys.RIGHT, keys.ENTER)
+        with menu.Screen(console) as screen:
+            value = screen.slider("level", value=0.0, minimum=0.0, maximum=10.0,
+                                  step=1.0, allow_typing=False)
+        assert value == 1.0, "t should have been ignored, not opened a field"
+
+    def test_decibels_round_trip_through_the_multiplier(self):
+        for decibels in (-40.0, -6.0, 0.0, 6.0, 24.0):
+            gain = menu.db_to_gain(decibels)
+            assert menu.gain_to_db(gain) == pytest.approx(decibels, abs=0.01)
+
+
+class TestSourceScanning:
+    def test_devices_are_enumerated_once_per_session(self, config_file, monkeypatch):
+        """Scanning costs ~0.5s on Windows; doing it per page is the freeze."""
+        calls = []
+        monkeypatch.setattr(keys, "interactive", lambda: True)
+        monkeypatch.setattr(editor, "list_sources", lambda: calls.append(1) or [
+            Source("display", "0", "Display 0"),
+            Source("mic", "Headset Mic", "microphone"),
+        ])
+        # visit audio, pick a device, visit video, pick a monitor, then save
+        Script("audio", "mic_device", "Headset Mic", CANCELLED,
+               "video", "display", "0", "save").install(monkeypatch)
+        editor.run(console)
+        assert len(calls) == 1, f"scanned {len(calls)} times instead of once"
+
+    def test_rescan_looks_again(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(keys, "interactive", lambda: True)
+        monkeypatch.setattr(editor, "list_sources", lambda: calls.append(1) or [
+            Source("mic", "Headset Mic", "microphone"),
+        ])
+        screen = menu.Screen(console)
+        sources = editor.Sources()
+        answers = iter([editor.RESCAN, "Headset Mic"])
+        monkeypatch.setattr(menu.Screen, "choose",
+                            lambda self, *a, **k: next(answers))
+        picked = editor._pick_device(screen, sources, "mic", "Microphone", None)
+        assert picked == "Headset Mic"
+        assert len(calls) == 2, "rescan must actually look again"
