@@ -4,9 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Phase 1 is complete: Windows (1c), Linux (1a) and macOS (1b) backends all exist. Phases 2–6 (source/quality selection, CLI polish, hotkeys, CI, release) are not started.
+Phase 1 (all three backends) and phase 5 (CI matrix) are done. Phases 2, 3, 4 and 6 (source/quality selection, config file, hotkeys, release) are not started.
 
-**Windows is the only backend verified against real hardware.** Linux and macOS are unit-tested at the command-construction level only — no X11, Wayland or avfoundation capture has ever been run. Treat the first real run on either as a debugging session, not a smoke test.
+Verification status per platform:
+
+| | Screen capture | Where it is proven |
+|---|---|---|
+| Windows | verified on real hardware | local runs; `tests/test_windows.py` |
+| Linux X11 | verified in CI | `tests/test_linux_capture.py` under Xvfb |
+| Linux Wayland | **never run** | command construction only |
+| macOS | **never run** — a hosted runner cannot hold Screen Recording permission | parser smoke test only |
+
+Wayland and macOS capture remain unproven; treat a first real run on either as a debugging session.
 
 `plan.md` (gitignored, Turkish) holds the phase order and remains the roadmap, **but its central technical premise turned out to be wrong — see "Why not mpv" below.** Trust this file over `plan.md` on engine choice.
 
@@ -60,6 +69,15 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 - **Device indices are discovered, never hardcoded** — `-list_devices` writes to stderr and exits non-zero by design, so the exit code is ignored and stderr is parsed. The camera is usually index 0 and the screen 1, and the microphone sits at audio 0 ahead of the loopback device, so picking index 0 gets you a webcam and a mic.
 - **Wayland source selection cannot be automated** — the `xdg-desktop-portal` dialog is an OS security boundary and the user must pick the screen/window there.
 - Backend selection is `platform.system()` plus `XDG_SESSION_TYPE` on Linux, in `get_backend()`.
+
+## CI
+
+`.github/workflows/ci.yml` runs Linux (3.10 floor and 3.13), macOS and Windows. Things worth knowing before editing it:
+
+- **`pyaudiowpatch` is marked `sys_platform == 'win32'`.** It publishes Windows-only wheels, so without the marker Linux and macOS try to build PyAudio from source and the install fails.
+- **The Linux job runs pytest under `xvfb-run`.** That `DISPLAY` is the entire reason `tests/test_linux_capture.py` executes rather than skipping — it paints the root window red with `xsetroot` and asserts the captured frames are actually red, because a recorder failure here yields a valid file full of black frames, not an error.
+- **The macOS `doctor` step is allowed to fail.** A hosted runner cannot be granted Screen Recording permission, so `doctor` correctly exits non-zero there. Don't "fix" that by weakening `doctor`.
+- `uv sync --locked` fails the build if `pyproject.toml` changed without relocking.
 
 ## Working style for this repo
 

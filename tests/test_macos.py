@@ -1,6 +1,7 @@
 """macOS backend wiring, tested against real `-list_devices` output. Nothing
 here needs a Mac; capturing an actual screen is still unverified."""
 
+import platform
 import subprocess
 from pathlib import Path
 
@@ -80,3 +81,13 @@ def test_undetermined_permission_does_not_block_recording(listed, monkeypatch, t
     """Non-macOS or an old macOS returns None; that must not be read as denied."""
     monkeypatch.setattr(macos, "screen_recording_permitted", lambda: None)
     assert MacBackend(tmp_path / "o.mp4").capture_command(tmp_path / "s.mkv")
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="needs a real Mac")
+def test_parser_matches_this_ffmpeg_builds_real_output():
+    """The device list is scraped from stderr, so its format is the fragile part."""
+    video, audio = list_avfoundation_devices()
+    assert all(isinstance(index, int) for index in {**video, **audio})
+    assert not any("indev" in name for name in {**video, **audio}.values()), (
+        "the log prefix leaked into a device name"
+    )

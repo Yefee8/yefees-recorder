@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"   # the floor declared in pyproject.toml
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.13"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      # ffmpeg is deliberately not bundled with the package, so CI installs it
+      # the same way a user would.
+      - name: Install ffmpeg and a virtual display
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg xvfb x11-xserver-utils
+
+      - name: Install ffmpeg
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Check the lockfile is up to date
+        run: uv sync --locked
+
+      - name: Smoke-test the CLI
+        if: runner.os != 'macOS'
+        run: uv run yefees-recorder doctor
+
+      # A hosted runner can never hold Screen Recording permission, so doctor
+      # correctly reports a problem and exits non-zero there. Report it, don't
+      # fail the build on it.
+      - name: Smoke-test the CLI
+        if: runner.os == 'macOS'
+        run: uv run yefees-recorder doctor || true
+
+      # xvfb-run provides the DISPLAY that turns on the real x11grab capture test.
+      - name: Test (under a virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a --server-args="-screen 0 1280x720x24" uv run pytest -v
+
+      - name: Test
+        if: runner.os != 'Linux'
+        run: uv run pytest -v
