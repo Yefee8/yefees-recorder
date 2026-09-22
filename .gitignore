@@ -1,0 +1,6 @@
+plan.md
+.venv/
+__pycache__/
+*.py[cod]
+dist/
+.pytest_cache/

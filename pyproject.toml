@@ -1,0 +1,23 @@
+[project]
+name = "yefees-recorder"
+version = "0.1.0"
+description = "Cross-platform screen recorder CLI built on mpv"
+readme = "README.md"
+authors = [
+    { name = "yefee8", email = "yavuzefefindikli8@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.15",
+    "rich>=13.9",
+]
+
+[project.scripts]
+yefees-recorder = "yefees_recorder.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8"]
