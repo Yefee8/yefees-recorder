@@ -1,14 +1,13 @@
-"""Writing settings back, and the interactive editor that drives it."""
+"""Writing settings back, the arrow-key menu, and the editor built on it."""
 
 import pytest
-from rich.prompt import Confirm, IntPrompt, Prompt
-from typer.testing import CliRunner
+from rich.console import Console
 
-from yefees_recorder import cli, config, keys
+from yefees_recorder import config, editor, keys, menu
 from yefees_recorder.capture import Source
-from yefees_recorder.cli import app
+from yefees_recorder.menu import CANCELLED, Item
 
-runner = CliRunner()
+console = Console(force_terminal=False, width=100)
 
 
 @pytest.fixture
@@ -29,9 +28,7 @@ class TestSetValues:
 
     def test_new_settings_land_above_presets_not_inside_them(self, config_file):
         """Appending at the end would silently make the setting part of a preset."""
-        config_file.write_text(
-            'fps = 30\n\n[presets.clip]\nquality = "low"\n', encoding="utf-8"
-        )
+        config_file.write_text('fps = 30\n\n[presets.clip]\nquality = "low"\n', encoding="utf-8")
         config.set_values({"mic": True})
         loaded = config.load()
         assert loaded.values == {"fps": 30, "mic": True}
@@ -58,7 +55,7 @@ class TestSetValues:
             config.set_values({"nonsense": 1})
 
     def test_values_survive_a_round_trip_through_the_parser(self, config_file):
-        values = {"fps": 60, "audio": False, "mic": True, "audio_offset": 0.25,
+        values = {"fps": 60, "audio": False, "mic": True, "mic_gain": 2.5,
                   "quality": "high", "window": 'a "quoted" name'}
         config.set_values(values)
         loaded = config.load()
@@ -66,77 +63,148 @@ class TestSetValues:
         assert loaded.warnings == []
 
 
-class Answers:
-    """Stands in for the rich prompts, replaying what a user would type."""
+def press(monkeypatch, *presses):
+    """Feed keystrokes to the menu, ending the loop rather than hanging."""
+    remaining = iter(presses)
+    monkeypatch.setattr(keys, "interactive", lambda: True)
+    monkeypatch.setattr(keys, "read_key", lambda timeout: next(remaining, keys.ESC))
 
-    def __init__(self, choices=(), texts=(), confirms=(), numbers=()):
-        self.choices, self.texts = iter(choices), iter(texts)
-        self.confirms, self.numbers = iter(confirms), iter(numbers)
+
+class TestMenu:
+    def test_enter_returns_the_highlighted_value(self, monkeypatch):
+        press(monkeypatch, keys.DOWN, keys.ENTER)
+        assert menu.choose("t", [Item("a", "a"), Item("b", "b")], console=console) == "b"
+
+    def test_moving_up_from_the_top_wraps_to_the_bottom(self, monkeypatch):
+        press(monkeypatch, keys.UP, keys.ENTER)
+        assert menu.choose("t", [Item("a", "a"), Item("b", "b")], console=console) == "b"
+
+    def test_disabled_items_are_skipped(self, monkeypatch):
+        items = [Item("a", "a"), Item("off", "off", enabled=False), Item("c", "c")]
+        press(monkeypatch, keys.DOWN, keys.ENTER)
+        assert menu.choose("t", items, console=console) == "c"
+
+    def test_escape_cancels(self, monkeypatch):
+        press(monkeypatch, keys.ESC)
+        assert menu.choose("t", [Item("a", "a")], console=console) is CANCELLED
+
+    def test_left_goes_back_when_allowed(self, monkeypatch):
+        press(monkeypatch, keys.LEFT)
+        assert menu.choose("t", [Item("a", "a")], console=console) is CANCELLED
+
+    def test_left_is_ignored_at_the_top_level(self, monkeypatch):
+        press(monkeypatch, keys.LEFT, keys.ENTER)
+        assert menu.choose("t", [Item("a", "a")], console=console, on_left=False) == "a"
+
+    def test_text_field_accepts_typing_and_backspace(self, monkeypatch):
+        press(monkeypatch, "6", "0", "9", keys.BACKSPACE, keys.ENTER)
+        assert menu.ask_text("n", console=console) == "60"
+
+    def test_text_field_rejects_a_bad_value_and_stays_open(self, monkeypatch):
+        press(monkeypatch, "x", keys.ENTER, keys.BACKSPACE, "7", keys.ENTER)
+        assert menu.ask_text("n", console=console,
+                             validate=lambda t: None if t.isdigit() else "nope") == "7"
+
+
+class Script:
+    """Stands in for the menus, replaying what the user would pick."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.titles = []
 
     def install(self, monkeypatch):
-        monkeypatch.setattr(Prompt, "ask", classmethod(
-            lambda cls, message, **kw: next(
-                self.choices if "Choose" in str(message) else self.texts
-            )
-        ))
-        monkeypatch.setattr(Confirm, "ask", classmethod(lambda cls, *a, **kw: next(self.confirms)))
-        monkeypatch.setattr(IntPrompt, "ask", classmethod(lambda cls, *a, **kw: next(self.numbers)))
+        def choose(title, items, **kwargs):
+            self.titles.append(title)
+            return self.answers.pop(0)
+
+        def ask_text(prompt, **kwargs):
+            self.titles.append(prompt)
+            return self.answers.pop(0)
+
+        monkeypatch.setattr(editor.menu, "choose", choose)
+        monkeypatch.setattr(editor.menu, "ask_text", ask_text)
 
 
 @pytest.fixture
 def interactive(monkeypatch):
     monkeypatch.setattr(keys, "interactive", lambda: True)
-    monkeypatch.setattr(cli, "list_sources", lambda: [
+    monkeypatch.setattr(editor, "list_sources", lambda: [
         Source("display", "0", "Display 0"),
         Source("display", "1", "Display 1"),
+        Source("window", "Firefox", "Firefox"),
         Source("audio", "Speakers", "system audio"),
         Source("mic", "Headset Mic", "microphone"),
     ])
 
 
 class TestEditor:
-    def test_editing_needs_a_terminal(self, config_file, monkeypatch):
+    def test_editing_needs_a_terminal(self, config_file, monkeypatch, capsys):
         monkeypatch.setattr(keys, "interactive", lambda: False)
-        result = runner.invoke(app, ["config", "--edit"])
-        assert result.exit_code == 1
-        assert "interactive terminal" in result.stdout
+        assert editor.run(console) is False
 
-    def test_a_session_writes_only_what_changed(self, config_file, interactive, monkeypatch):
-        # 2 = fps -> 24, 6 = mic -> yes, then save
-        Answers(choices=["2", "6", "s"], texts=["24"], confirms=[True]).install(monkeypatch)
-        cli._edit_config()
-        assert config.load().values == {"fps": 24, "mic": True}
+    def test_choosing_a_window_clears_the_monitor_and_the_area(
+        self, config_file, interactive, monkeypatch
+    ):
+        """The whole point of one shared menu: these three cannot coexist."""
+        config_file.write_text('display = 1\n', encoding="utf-8")
+        Script("video", "window", "Firefox", "save").install(monkeypatch)
+        assert editor.run(console) is True
+        saved = config.load().values
+        assert saved["window"] == "Firefox"
+        assert "display" not in saved and "region" not in saved
 
-    def test_device_settings_offer_the_real_devices(self, config_file, interactive, monkeypatch):
-        # 7 = mic_device, picking entry 1 from the listed microphones
-        Answers(choices=["7", "s"], numbers=[1]).install(monkeypatch)
-        cli._edit_config()
-        assert config.load().values == {"mic_device": "Headset Mic"}
+    def test_choosing_a_monitor_clears_a_window(self, config_file, interactive, monkeypatch):
+        config_file.write_text('window = "Firefox"\n', encoding="utf-8")
+        Script("video", "display", "1", "save").install(monkeypatch)
+        assert editor.run(console) is True
+        saved = config.load().values
+        assert saved["display"] == 1, "a monitor must be stored as a number"
+        assert "window" not in saved
 
-    def test_display_is_stored_as_a_number_not_a_string(self, config_file, interactive, monkeypatch):
-        Answers(choices=["9", "s"], numbers=[2]).install(monkeypatch)
-        cli._edit_config()
-        assert config.load().values == {"display": 1}
+    def test_whole_desktop_clears_everything(self, config_file, interactive, monkeypatch):
+        config_file.write_text('region = "0,0,800x600"\n', encoding="utf-8")
+        Script("video", "all", "save").install(monkeypatch)
+        assert editor.run(console) is True
+        assert config.load().values == {}
+
+    def test_an_area_replaces_a_monitor(self, config_file, interactive, monkeypatch):
+        config_file.write_text("display = 0\n", encoding="utf-8")
+        Script("video", "region", "10,20,640x480", "save").install(monkeypatch)
+        assert editor.run(console) is True
+        assert config.load().values == {"region": "10,20,640x480"}
+
+    def test_audio_toggles_and_device_choice(self, config_file, interactive, monkeypatch):
+        Script("audio", "mic", "mic_device", "Headset Mic", CANCELLED, "save").install(monkeypatch)
+        assert editor.run(console) is True
+        saved = config.load().values
+        assert saved["mic"] is True
+        assert saved["mic_device"] == "Headset Mic"
+
+    def test_gain_is_stored_as_a_number(self, config_file, interactive, monkeypatch):
+        Script("audio", "mic_gain", "2.5", CANCELLED, "save").install(monkeypatch)
+        assert editor.run(console) is True
+        assert config.load().values == {"mic_gain": 2.5}
         assert config.load().warnings == []
 
-    def test_choosing_automatic_clears_a_setting(self, config_file, interactive, monkeypatch):
-        config_file.write_text("display = 1\n", encoding="utf-8")
-        Answers(choices=["9", "s"], numbers=[0]).install(monkeypatch)
-        cli._edit_config()
-        assert config.load().values == {}
-
     def test_quitting_writes_nothing(self, config_file, interactive, monkeypatch):
-        Answers(choices=["2", "q"], texts=["24"], confirms=[True]).install(monkeypatch)
-        cli._edit_config()
+        Script("video", "display", "1", "quit", True).install(monkeypatch)
+        assert editor.run(console) is False
         assert not config_file.exists() or config.load().values == {}
 
-    def test_a_rejected_value_leaves_the_setting_alone(self, config_file, interactive, monkeypatch):
-        # "abc" is not a frame rate, so nothing should be staged
-        Answers(choices=["2", "s"], texts=["abc"]).install(monkeypatch)
-        cli._edit_config()
-        assert config.load().values == {}
+    def test_saving_with_no_changes_writes_nothing(self, config_file, interactive, monkeypatch):
+        Script("save").install(monkeypatch)
+        assert editor.run(console) is False
 
-    def test_nonsense_menu_input_does_not_crash(self, config_file, interactive, monkeypatch):
-        Answers(choices=["99", "zz", "s"]).install(monkeypatch)
-        cli._edit_config()
-        assert config.load().values == {}
+    def test_backing_out_of_a_submenu_keeps_earlier_edits(
+        self, config_file, interactive, monkeypatch
+    ):
+        Script("output", "fps", "48", CANCELLED, "save").install(monkeypatch)
+        assert editor.run(console) is True
+        assert config.load().values == {"fps": 48}
+
+    def test_cancelling_a_device_choice_changes_nothing(
+        self, config_file, interactive, monkeypatch
+    ):
+        Script("audio", "audio_device", CANCELLED, CANCELLED, "save").install(monkeypatch)
+        assert editor.run(console) is False

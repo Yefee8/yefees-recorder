@@ -107,7 +107,7 @@ def test_wayland_supports_region_but_not_display_or_window(monkeypatch, tmp_path
 
 def test_audio_device_overrides_the_default_monitor(tmp_path):
     inputs = LinuxX11Backend(tmp_path / "o.mp4", audio_device="alsa_output.pci.monitor").audio_inputs()
-    assert inputs[0][-1] == "alsa_output.pci.monitor"
+    assert inputs[0].args[-1] == "alsa_output.pci.monitor"
 
 
 def test_system_audio_and_mic_become_two_mixed_inputs(monkeypatch, tmp_path):
@@ -126,7 +126,7 @@ def test_system_audio_and_mic_become_two_mixed_inputs(monkeypatch, tmp_path):
 def test_mic_only_leaves_the_monitor_source_out(monkeypatch, tmp_path):
     monkeypatch.setattr(linux, "default_mic_source", lambda: "alsa_input.mic")
     inputs = LinuxX11Backend(tmp_path / "o.mp4", audio=False, mic=True).audio_inputs()
-    assert len(inputs) == 1 and inputs[0][-1] == "alsa_input.mic"
+    assert len(inputs) == 1 and inputs[0].args[-1] == "alsa_input.mic"
 
 
 def test_wayland_refuses_to_record_both_audio_sources(monkeypatch, tmp_path):

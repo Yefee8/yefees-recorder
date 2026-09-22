@@ -19,14 +19,14 @@ import signal
 import subprocess
 from pathlib import Path
 
-from .capture import CaptureBackend, Source
+from .capture import AudioInput, CaptureBackend, Source
 
 # `xrandr --listmonitors` prints e.g. " 1: +HDMI-1 1920/521x1080/293+1920+0  HDMI-1"
 MONITOR_LINE = re.compile(r"(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)")
 
 WAYLAND_HELP = (
     "Recording on Wayland needs wf-recorder, which is not installed.\n"
-    "ffmpeg cannot capture Wayland itself — the screen is only reachable through "
+    "ffmpeg cannot capture Wayland itself - the screen is only reachable through "
     "xdg-desktop-portal/PipeWire.\n"
     "  Arch:   sudo pacman -S wf-recorder\n"
     "  Fedora: sudo dnf install wf-recorder\n"
@@ -34,6 +34,14 @@ WAYLAND_HELP = (
     "wf-recorder supports wlroots compositors (Sway, Hyprland, river). On GNOME or "
     "KDE, use your desktop's own screen recorder for now, or run an X11 session."
 )
+
+
+def _pactl(arguments: list[str]) -> str:
+    """Run pactl and return its output, raising if it failed."""
+    result = subprocess.run(["pactl", *arguments], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        raise RuntimeError(f"pactl {' '.join(arguments)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
 
 
 def _read(command: list[str]) -> str:
@@ -90,9 +98,35 @@ def default_mic_source() -> str:
     return result or "default"
 
 
+SINK_INPUT = re.compile(r"Sink Input #(\d+)")
+APP_NAME = re.compile(r'application\.name = "([^"]*)"')
+
+# The sink recordings are routed through while one application is captured.
+CAPTURE_SINK = "yefees_capture"
+
+
+def list_applications() -> list[tuple[str, str]]:
+    """(sink-input id, application name) for everything currently playing.
+
+    Only applications actually producing audio appear here - a silent or
+    closed app has no sink input.
+    """
+    found, current = [], None
+    for line in _read(["pactl", "list", "sink-inputs"]).splitlines():
+        header = SINK_INPUT.search(line)
+        if header:
+            current = header.group(1)
+            continue
+        name = APP_NAME.search(line)
+        if name and current is not None:
+            found.append((current, name.group(1)))
+            current = None
+    return found
+
+
 def list_sources() -> list[Source]:
     sources = [
-        Source("display", str(index), f"Display {index} — {w}x{h} at ({x},{y})")
+        Source("display", str(index), f"Display {index} - {w}x{h} at ({x},{y})")
         for index, (x, y, w, h) in enumerate(list_monitors())
     ]
     sources += [Source("window", title, title) for _, title in list_windows()]
@@ -103,6 +137,7 @@ def list_sources() -> list[Source]:
             sources.append(Source("audio", name, "system audio"))
         else:
             sources.append(Source("mic", name, "microphone"))
+    sources += [Source("app", name, "application audio") for _, name in list_applications()]
     return sources
 
 
@@ -149,12 +184,54 @@ class LinuxX11Backend(CaptureBackend):
         # Without -video_size x11grab works the screen size out itself.
         return args + ["-i", display]
 
-    def audio_inputs(self) -> list[list[str]]:
+    def setup(self) -> None:
+        self._modules = []
+        if not self.app_audio:
+            return
+        if not shutil.which("pactl"):
+            raise RuntimeError("Recording one application needs pactl (PulseAudio or PipeWire).")
+
+        matches = [i for i, name in list_applications() if self.app_audio.lower() in name.lower()]
+        if not matches:
+            playing = ", ".join(name for _, name in list_applications()) or "nothing is playing"
+            raise RuntimeError(
+                f"No application matching {self.app_audio!r}. Currently playing: {playing}"
+            )
+
+        sink = _read(["pactl", "get-default-sink"]).strip()
+        try:
+            # A null sink to capture from, plus a loopback of it to the real
+            # output - without that second module the user stops hearing the app
+            # they are recording.
+            self._modules.append(_pactl(
+                ["load-module", "module-null-sink", f"sink_name={CAPTURE_SINK}",
+                 f"sink_properties=device.description={CAPTURE_SINK}"]))
+            self._modules.append(_pactl(
+                ["load-module", "module-loopback",
+                 f"source={CAPTURE_SINK}.monitor", f"sink={sink}", "latency_msec=50"]))
+            for sink_input in matches:
+                _pactl(["move-sink-input", sink_input, CAPTURE_SINK])
+        except Exception:
+            self.teardown()
+            raise
+
+    def teardown(self) -> None:
+        """Unload our modules, which moves the application's audio back."""
+        for module in reversed(getattr(self, "_modules", [])):
+            _read(["pactl", "unload-module", module])
+        self._modules = []
+
+    def audio_inputs(self) -> list[AudioInput]:
         inputs = []
         if self.want_audio:
-            inputs.append(["-f", "pulse", "-i", self.audio_device or default_monitor_source()])
+            if self.app_audio:
+                source = f"{CAPTURE_SINK}.monitor"
+            else:
+                source = self.audio_device or default_monitor_source()
+            inputs.append(AudioInput(["-f", "pulse", "-i", source], self.audio_gain))
         if self.want_mic:
-            inputs.append(["-f", "pulse", "-i", self.mic_device or default_mic_source()])
+            inputs.append(AudioInput(
+                ["-f", "pulse", "-i", self.mic_device or default_mic_source()], self.mic_gain))
         return inputs
 
 
@@ -170,9 +247,14 @@ class LinuxWaylandBackend(CaptureBackend):
             raise RuntimeError(WAYLAND_HELP)
         if self.window is not None or self.display is not None:
             raise RuntimeError(
-                "Selecting a window or display is not supported on Wayland — the "
+                "Selecting a window or display is not supported on Wayland - the "
                 "compositor decides what a recorder may see. Use --region, or run "
                 "wf-recorder directly with its own -o/-g options."
+            )
+        if self.app_audio:
+            raise RuntimeError(
+                "Recording one application is only wired up for X11 so far; on Wayland, "
+                "route the app with pactl yourself and pass --audio-device."
             )
         if self.want_audio and self.want_mic:
             raise RuntimeError(

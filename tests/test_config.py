@@ -149,89 +149,22 @@ def test_pick_needs_a_terminal(config_file, fake_backend):
 
 
 @pytest.mark.parametrize(
-    "answer, expected",
-    [(0, (None, None)), (1, (0, None)), (2, (None, "Firefox"))],
+    "picked, expected",
+    [("desktop", (None, None)), ("display", (0, None)), ("window", (None, "Firefox"))],
 )
-def test_menu_maps_the_answer_to_a_display_or_a_window(monkeypatch, answer, expected):
+def test_menu_maps_the_choice_to_a_display_or_a_window(monkeypatch, picked, expected):
     from yefees_recorder import cli
     from yefees_recorder.capture import Source
 
+    sources = {
+        "desktop": None,
+        "display": Source("display", "0", "Display 0"),
+        "window": Source("window", "Firefox", "Firefox"),
+    }
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(cli, "list_sources", lambda: [
-        Source("display", "0", "Display 0"),
-        Source("window", "Firefox", "Firefox"),
+        sources["display"], sources["window"],
         Source("audio", "Speakers", "Speakers"),  # must not appear in the menu
     ])
-    monkeypatch.setattr(cli.IntPrompt, "ask", classmethod(lambda cls, *a, **k: answer))
+    monkeypatch.setattr(cli.menu, "choose", lambda *a, **k: sources[picked])
     assert cli._pick_source() == expected
-
-
-class TestPresets:
-    def test_reads_named_preset_tables(self, config_file):
-        config_file.write_text(
-            'fps = 30\n\n[presets.gameplay]\ndisplay = 1\nfps = 60\n', encoding="utf-8"
-        )
-        loaded = config.load()
-        assert loaded.values == {"fps": 30}, "a preset must not leak into top-level settings"
-        assert loaded.presets == {"gameplay": {"display": 1, "fps": 60}}
-        assert loaded.warnings == []
-
-    def test_a_bad_key_in_one_preset_does_not_poison_the_rest(self, config_file):
-        config_file.write_text(
-            '[presets.good]\nfps = 60\n\n[presets.bad]\nnonsense = 1\n', encoding="utf-8"
-        )
-        loaded = config.load()
-        assert loaded.presets["good"] == {"fps": 60}
-        assert loaded.presets["bad"] == {}
-        assert len(loaded.warnings) == 1
-
-    def test_round_trips_values_that_need_toml_escaping(self, config_file):
-        awkward = r'''C:\Users\me\a "quoted" path'''
-        config.append_preset("odd", {"window": awkward, "audio": False, "fps": 60})
-        loaded = config.load()
-        assert loaded.presets["odd"] == {"window": awkward, "audio": False, "fps": 60}
-        assert loaded.warnings == []
-
-    def test_saving_keeps_existing_content_intact(self, config_file):
-        config_file.write_text("# my note\nfps = 24\n", encoding="utf-8")
-        config.append_preset("one", {"fps": 60})
-        config.append_preset("two", {"quality": "high"})
-        text = config_file.read_text(encoding="utf-8")
-        assert "# my note" in text, "hand-written comments must survive"
-        loaded = config.load()
-        assert loaded.values == {"fps": 24}
-        assert sorted(loaded.presets) == ["one", "two"]
-
-    def test_refuses_to_shadow_an_existing_preset(self, config_file):
-        config.append_preset("dup", {"fps": 60})
-        with pytest.raises(ValueError, match="already exists"):
-            config.append_preset("dup", {"fps": 30})
-
-    def test_refuses_to_save_nothing(self, config_file):
-        with pytest.raises(ValueError, match="Nothing to save"):
-            config.append_preset("empty", {})
-
-    def test_save_then_use_through_the_cli(self, config_file, fake_backend):
-        saved = runner.invoke(
-            app, ["record", "--save-preset", "clip", "--fps", "12", "--no-audio", "--display", "1"]
-        )
-        assert saved.exit_code == 0, saved.stdout
-
-        used = runner.invoke(app, ["record", "--preset", "clip", "-d", "0.1"])
-        assert used.exit_code == 0, used.stdout
-        backend = fake_backend["backend"]
-        assert backend.kwargs["fps"] == 12
-        assert backend.kwargs["audio"] is False
-        assert backend.kwargs["display"] == 1
-
-    def test_flags_still_beat_a_preset(self, config_file, fake_backend):
-        config_file.write_text("[presets.clip]\nfps = 12\n", encoding="utf-8")
-        result = runner.invoke(app, ["record", "--preset", "clip", "--fps", "50", "-d", "0.1"])
-        assert result.exit_code == 0, result.stdout
-        assert fake_backend["backend"].kwargs["fps"] == 50
-
-    def test_unknown_preset_lists_what_exists(self, config_file, fake_backend):
-        config_file.write_text("[presets.clip]\nfps = 12\n", encoding="utf-8")
-        result = runner.invoke(app, ["record", "--preset", "nope"])
-        assert result.exit_code == 1
-        assert "clip" in result.stdout

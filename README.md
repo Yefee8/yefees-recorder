@@ -41,6 +41,7 @@ yefees-recorder record --audio-device "Speakers"     # a specific audio source
 yefees-recorder record --mic                         # add the microphone
 yefees-recorder record --mic --no-audio              # microphone only
 yefees-recorder record --mic-device "Headset"        # a specific microphone
+yefees-recorder record --mic-gain 4                  # mics are quiet; turn it up
 yefees-recorder record -q high                       # low | balanced | high
 yefees-recorder record --pick                        # choose from a menu instead
 ```
@@ -56,6 +57,25 @@ frozen frame.
 System audio and the microphone are independent — record either, both or
 neither. With both on they are mixed into a single track at their original
 levels, so adding a microphone does not make the system audio quieter.
+
+**Microphones are usually far quieter than system audio**, so a voice can be
+buried under a game or video even though it is being recorded. Raise it with
+`--mic-gain` (a multiplier: `2` is +6 dB, `4` is +12 dB) or set `mic_gain` in
+the config.
+
+### Recording one application's audio
+
+```
+yefees-recorder record --app-audio "Firefox"
+```
+
+Only Linux can do this directly, by routing that application through a capture
+sink with `pactl` and putting it back when the recording ends. On Windows and
+macOS the operating system offers no way for ffmpeg to capture a single
+application, so the command explains the alternative instead: send the app to
+its own output device (Windows: Settings > System > Sound > Volume mixer;
+macOS: a virtual device such as BlackHole) and record that device with
+`--audio-device`.
 
 `sources` lists every audio device separately as `audio` (what the machine is
 playing) and `mic` (what it can hear). On a machine with several outputs —
@@ -117,9 +137,18 @@ yefees-recorder config --edit   # change settings from a menu, no flags needed
 yefees-recorder config --init   # write a commented starter file
 ```
 
-`config --edit` walks through every setting and offers the devices this machine
-actually has, so you pick a monitor or a microphone from a list instead of
-typing its name. Nothing is written until you save, and your comments survive.
+`config --edit` opens an arrow-key menu: move with up/down, open a submenu or
+choose with Enter, go back with Left or Esc. Settings are grouped into **Video
+source**, **Audio**, and **Output and quality**, and device settings offer what
+this machine actually has, so you pick a monitor or a microphone from a list
+instead of typing its name.
+
+Video source is a single choice — whole desktop, a monitor, a window or an area
+— because only one of them can be recorded. Picking a window clears the monitor
+and the area automatically.
+
+Nothing is written until you choose Save, only the settings you changed are
+written, and your comments survive.
 
 ```toml
 output_dir = "~/Videos"
@@ -128,9 +157,12 @@ quality = "balanced"
 
 audio = true                    # record what the machine plays
 audio_device = "Speakers"
+audio_gain = 1.0
 mic = false                     # also record the microphone
 mic_device = "Headset"
+mic_gain = 4.0                  # mics need boosting more often than not
 audio_offset = 0.0
+app_audio = "Firefox"           # Linux only
 
 display = 0
 ```

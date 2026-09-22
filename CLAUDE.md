@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-All six phases of `plan.md` are implemented, plus microphone capture and an interactive settings editor added afterwards. Nothing has been pushed or published yet. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
+All six phases of `plan.md` are implemented, plus microphone capture, audio levels, per-application audio and an arrow-key settings editor added afterwards. Nothing has been pushed or published yet. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
 
 Verification status per platform:
 
@@ -59,6 +59,8 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 - **Pause is implemented as segmentation.** ffmpeg has no pause. `pause()` ends the current ffmpeg process, `resume()` starts a new one, and `stop()` muxes each segment with its audio and concatenates them with `-c copy`. Wall-clock time spent paused therefore never reaches the output. Nothing calls `pause()` yet — hotkeys are phase 4; it is exercised by tests.
 - **Segments are `.mkv` internally** (survives an abrupt kill) and only the final concat writes the user's chosen extension.
 - **Audio arrives two ways, and Windows uses both at once.** `audio_inputs()` returns one argument list per input ffmpeg can capture directly; `make_audio_recorder()` returns a side recorder whose wav is muxed in on stop. Linux and macOS put system audio *and* the microphone through `audio_inputs()`. Windows can only put the **microphone** there (dshow records mics fine, it just has no loopback), so system audio stays a side recorder and the two are mixed at mux time.
+- **Per-application audio only works on Linux.** `setup()`/`teardown()` on `CaptureBackend` exist for it: the Linux backend loads a null sink plus a `module-loopback` back to the real output (without that second module the user stops hearing the app they are recording), moves the app's sink-input across, and unloads both on stop. `teardown()` runs even when `start()` fails. Windows would need the process-loopback API and macOS Core Audio process taps, neither reachable through ffmpeg, so both raise an error naming the routing workaround instead.
+- **Microphone gain is not cosmetic.** A mic sits roughly 30 dB below system audio, so without `mic_gain` a voice is inaudible in the mix even though it is recorded correctly. Verified against a synthetic tone: gain 2 gives exactly +6.0 dB, gain 4 gives +12.0 dB.
 - **`amix` must be given `normalize=0`.** By default it scales every input by 1/n, so switching the microphone on quietens system audio — measured at 4.4 dB (mean −8.6 → −13.0 dB). Both mix sites set it, and a test pins it.
 - **`-vf` and `-filter_complex` cannot both be passed.** When there is more than one audio input the video filter chain moves into the complex graph as `[0:v]...[vout]`, so anything added to `video_filters()` must keep working in both shapes.
 - **Windows audio does not come from ffmpeg.** dshow exposes no loopback device (verified: `-list_devices` shows only a microphone), so `PyAudioWPatch` captures WASAPI loopback to a wav that is muxed in afterwards.
@@ -117,10 +119,21 @@ Presets are `[presets.NAME]` tables in the same file, merged over the top-level 
 
 `--pick` shows a `rich` menu of displays and windows (never audio) and returns a `(display, window)` pair. It refuses to run without a TTY and refuses to combine with an explicit `--display/--window/--region`.
 
+## Menus and terminal encoding
+
+`menu.py` draws arrow-key menus with `rich.live`; `keys.py` decodes the arrows (two values after a `\x00`/`\xe0` prefix on Windows, `ESC [ A..D` elsewhere). No dependency was added for this.
+
+**Everything rendered inside `rich.live` must go through `menu.safe()`.** A legacy Windows console runs on cp1252 and `rich.live` *raises* `UnicodeEncodeError` rather than substituting, which takes the whole menu down. This is not hypothetical twice over: the pointer glyph crashed it on first render, and window titles are other people's data — on a Turkish desktop they routinely contain characters cp1252 cannot encode. `menu.FANCY` decides whether the nicer glyphs are usable at all, and `safe()` replaces anything unrepresentable.
+
+Prefer plain ASCII in strings this project controls; the em dash was removed from every label for that reason.
+
 ## The settings editor
 
 `config --edit` is the no-flags way to change settings, and `--init` offers it straight after creating the file.
 
+- The editor is in `editor.py`, driven entirely through `menu.choose` / `menu.ask_text`, which is what makes it testable: the tests replace those two functions rather than simulating keystrokes.
+- **Video source is one choice, not three settings.** `display`, `window` and `region` are mutually exclusive, so choosing any one of them clears the other two via `SOURCE_KEYS`. Anything that sets one of them directly must clear the rest.
+- **After saving, the editor re-reads the file** and reports what it actually holds rather than what it believes it wrote. There is no caching anywhere: `record` loads the config fresh on every run.
 - **`set_values()` edits the file line by line**: it rewrites an existing line, uncomments a matching template line, or inserts a new one. It never re-serialises the parsed document, so comments and layout survive.
 - **New settings are inserted before the first table header, never appended.** Appending would drop the key inside the last `[presets.x]` table and silently turn a global setting into part of a preset. There is a test for exactly this.
 - Device settings (`display`, `window`, `audio_device`, `mic_device`) offer the output of `list_sources()` as a numbered list, so the user picks a real device rather than typing a name. `display` is stored as an `int` and everything else as a string — storing `display` as a string would fail the type check on the next load.

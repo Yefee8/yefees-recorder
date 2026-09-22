@@ -1,6 +1,6 @@
 """Config file handling.
 
-Precedence is flag, then config file, then built-in default — so a flag always
+Precedence is flag, then config file, then built-in default - so a flag always
 wins and the file only supplies what was left unsaid.
 
 The file is only ever read here, never written from parsed data: `--init`
@@ -30,8 +30,11 @@ DEFAULTS: dict[str, Any] = {
     "audio": True,
     "audio_offset": 0.0,
     "audio_device": None,
+    "audio_gain": 1.0,
     "mic": False,
     "mic_device": None,
+    "mic_gain": 1.0,
+    "app_audio": None,
     "display": None,
     "window": None,
     "region": None,
@@ -46,8 +49,11 @@ TYPES: dict[str, Any] = {
     "audio": bool,
     "audio_offset": (int, float),
     "audio_device": str,
+    "audio_gain": (int, float),
     "mic": bool,
     "mic_device": str,
+    "mic_gain": (int, float),
+    "app_audio": str,
     "display": int,
     "window": str,
     "region": str,
@@ -72,6 +78,14 @@ TEMPLATE = """\
 # Record the microphone as well. With both on, the two are mixed into one track.
 # mic = false
 # mic_device = "Microphone"   # substring of a name from `yefees-recorder sources`
+
+# Levels, as multipliers: 2.0 is twice as loud. Microphones usually sit well
+# below system audio, so a mic gain above 1 is often needed to hear a voice.
+# audio_gain = 1.0
+# mic_gain = 1.0
+
+# Record one application instead of the whole output device (Linux only).
+# app_audio = "Firefox"
 
 # display = 0   # record one monitor by default
 # window = "Firefox"
@@ -161,7 +175,7 @@ def set_values(changes: dict[str, Any], path: Path | None = None) -> Path:
     """Write settings into the config file, editing it line by line.
 
     Existing lines are rewritten in place, commented-out template lines are
-    uncommented, and anything new is inserted *before the first table header* —
+    uncommented, and anything new is inserted *before the first table header* -
     appending at the end would silently land the setting inside the last
     `[presets.x]` table. A value of None removes the setting.
 
@@ -217,7 +231,7 @@ def append_preset(name: str, values: dict[str, Any], path: Path | None = None) -
     if name in load(path).presets:
         raise ValueError(f"Preset {name!r} already exists in {path}; edit or remove it first.")
     if not values:
-        raise ValueError("Nothing to save — pass the options you want the preset to remember.")
+        raise ValueError("Nothing to save - pass the options you want the preset to remember.")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(encoding="utf-8") if path.exists() else TEMPLATE

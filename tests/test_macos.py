@@ -119,7 +119,7 @@ def test_region_becomes_a_crop_filter(listed, monkeypatch, tmp_path):
 
 def test_named_audio_device_is_selected(listed, tmp_path):
     backend = MacBackend(tmp_path / "o.mp4", audio_device="built-in")
-    assert backend.audio_inputs()[0][-1] == "none:0"
+    assert backend.audio_inputs()[0].args[-1] == "none:0"
     with pytest.raises(RuntimeError, match="No audio device matching"):
         MacBackend(tmp_path / "o.mp4", audio_device="nonexistent").audio_inputs()
 
@@ -128,11 +128,11 @@ def test_mic_picks_the_non_loopback_device(listed, tmp_path):
     """BlackHole is at audio 1 and the built-in mic at 0; they must not swap."""
     backend = MacBackend(tmp_path / "o.mp4", mic=True)
     inputs = backend.audio_inputs()
-    assert [i[-1] for i in inputs] == ["none:1", "none:0"]
+    assert [i.args[-1] for i in inputs] == ["none:1", "none:0"]
 
 
 def test_missing_loopback_still_records_the_mic(listed, monkeypatch, tmp_path):
     monkeypatch.setattr(macos, "find_loopback_device", lambda devices: None)
     backend = MacBackend(tmp_path / "o.mp4", mic=True)
-    assert [i[-1] for i in backend.audio_inputs()] == ["none:0"]
+    assert [i.args[-1] for i in backend.audio_inputs()] == ["none:0"]
     assert backend.audio_error

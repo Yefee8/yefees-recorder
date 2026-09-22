@@ -1,6 +1,6 @@
 """Windows backend: gdigrab for video, WASAPI loopback for system audio.
 
-dshow exposes no loopback device, so system audio cannot come from ffmpeg here —
+dshow exposes no loopback device, so system audio cannot come from ffmpeg here -
 PyAudioWPatch captures it natively and the wav is muxed in afterwards.
 """
 
@@ -14,14 +14,14 @@ import wave
 from ctypes import wintypes
 from pathlib import Path
 
-from .capture import CaptureBackend, Source
+from .capture import AudioInput, CaptureBackend, Source
 
 DWMWA_CLOAKED = 14  # set on UWP windows that exist but are not really on screen
 
 # ffmpeg prints dshow devices as: [dshow @ ...] "Name here" (audio)
 DSHOW_AUDIO = re.compile(r'"([^"]+)"\s*\(audio\)')
 
-# Windows feeds a loopback stream only while something is actually playing — it
+# Windows feeds a loopback stream only while something is actually playing - it
 # goes quiet mid-recording and may never fire at all on a silent machine. So the
 # wav is built against wall clock: every callback drops its data at the position
 # the clock says it belongs, and the gaps are filled with real silence.
@@ -98,7 +98,7 @@ def list_loopback_devices() -> list[str]:
 def list_microphones() -> list[str]:
     """Microphone names dshow can open.
 
-    dshow has no loopback device, which is why system audio needs WASAPI — but
+    dshow has no loopback device, which is why system audio needs WASAPI - but
     it lists and records microphones perfectly well.
     """
     try:
@@ -118,7 +118,7 @@ def default_microphone() -> str | None:
 
 def list_sources() -> list[Source]:
     sources = [
-        Source("display", str(index), f"Display {index} — {w}x{h} at ({x},{y})")
+        Source("display", str(index), f"Display {index} - {w}x{h} at ({x},{y})")
         for index, (x, y, w, h) in enumerate(list_monitors())
     ]
     sources += [Source("window", title, title) for title in list_window_titles()]
@@ -228,7 +228,20 @@ class WindowsBackend(CaptureBackend):
             args += ["-offset_x", str(x), "-offset_y", str(y), "-video_size", f"{width}x{height}"]
         return args + ["-i", "desktop"]
 
-    def audio_inputs(self) -> list[list[str]]:
+    def setup(self) -> None:
+        if not self.app_audio:
+            return
+        outputs = ", ".join(list_loopback_devices()) or "none found"
+        raise RuntimeError(
+            "Windows has no way to capture one application's audio directly - that "
+            "needs the process-loopback API, which ffmpeg does not expose.\n"
+            "What does work: send the app to its own output device in Settings > "
+            "System > Sound > Volume mixer, then record that device with "
+            "--audio-device.\n"
+            f"Output devices available here: {outputs}"
+        )
+
+    def audio_inputs(self) -> list[AudioInput]:
         # Only the microphone goes through ffmpeg here; system audio has to come
         # from WASAPI because dshow exposes no loopback device.
         if not self.want_mic:
@@ -237,7 +250,7 @@ class WindowsBackend(CaptureBackend):
         if device is None:
             self.mic_error = "No microphone found; recording without it."
             return []
-        return [["-f", "dshow", "-i", f"audio={device}"]]
+        return [AudioInput(["-f", "dshow", "-i", f"audio={device}"], self.mic_gain)]
 
     def make_audio_recorder(self):
         if not self.want_audio:

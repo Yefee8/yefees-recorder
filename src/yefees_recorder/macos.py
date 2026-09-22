@@ -17,7 +17,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .capture import CaptureBackend, Source
+from .capture import AudioInput, CaptureBackend, Source
 
 # Virtual output devices that loop system audio back to an input.
 LOOPBACK_DEVICE_HINTS = ("blackhole", "soundflower", "loopback audio", "ishowu", "multi-output")
@@ -34,7 +34,7 @@ PERMISSION_HELP = (
 )
 
 BLACKHOLE_HELP = (
-    "No loopback audio device found, so system audio cannot be captured — macOS "
+    "No loopback audio device found, so system audio cannot be captured - macOS "
     "has no built-in way to record its own output.\n"
     "Install one with `brew install blackhole-2ch`, then in Audio MIDI Setup create "
     "a Multi-Output Device containing both BlackHole and your speakers and select it "
@@ -84,7 +84,7 @@ def find_loopback_device(audio_devices: dict[int, str]) -> int | None:
 
 
 def screen_device_indices(video_devices: dict[int, str]) -> list[int]:
-    """avfoundation indices of the screens, in order — index 0 is usually a camera."""
+    """avfoundation indices of the screens, in order - index 0 is usually a camera."""
     return [i for i, name in sorted(video_devices.items()) if name.lower().startswith("capture screen")]
 
 
@@ -157,7 +157,7 @@ class MacBackend(CaptureBackend):
     def video_input_args(self) -> list[str]:
         if self.window:
             raise RuntimeError(
-                "avfoundation cannot record a single window — it only exposes whole "
+                "avfoundation cannot record a single window - it only exposes whole "
                 "screens. Use --region to crop to the window's area instead."
             )
         if screen_recording_permitted() is False:
@@ -193,7 +193,16 @@ class MacBackend(CaptureBackend):
             )
         return found
 
-    def audio_inputs(self) -> list[list[str]]:
+    def setup(self) -> None:
+        if self.app_audio:
+            raise RuntimeError(
+                "macOS cannot capture one application's audio - Core Audio process "
+                "taps are not reachable through ffmpeg.\n"
+                "Route the app to a virtual output device (BlackHole) in its own "
+                "settings or with a tool like Loopback, then use --audio-device."
+            )
+
+    def audio_inputs(self) -> list[AudioInput]:
         # Separate avfoundation inputs rather than the combined "screen:audio"
         # form, which drifts between the streams.
         inputs = []
@@ -205,7 +214,8 @@ class MacBackend(CaptureBackend):
             if loopback is None:
                 self.audio_error = BLACKHOLE_HELP
             else:
-                inputs.append(["-f", "avfoundation", "-i", f"none:{loopback}"])
+                inputs.append(AudioInput(
+                    ["-f", "avfoundation", "-i", f"none:{loopback}"], self.audio_gain))
         if self.want_mic:
             if self.mic_device:
                 mic = self._named_device(self.mic_device)
@@ -214,5 +224,6 @@ class MacBackend(CaptureBackend):
             if mic is None:
                 self.mic_error = "No microphone found; recording without it."
             else:
-                inputs.append(["-f", "avfoundation", "-i", f"none:{mic}"])
+                inputs.append(AudioInput(
+                    ["-f", "avfoundation", "-i", f"none:{mic}"], self.mic_gain))
         return inputs

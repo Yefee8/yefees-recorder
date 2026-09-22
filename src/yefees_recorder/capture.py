@@ -38,6 +38,17 @@ QUALITY_PRESETS = {
 REGION = re.compile(r"^\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*x\s*(\d+)\s*$")
 
 
+class AudioInput(NamedTuple):
+    """One ffmpeg audio input, with the gain to apply before mixing.
+
+    Microphones typically sit far below system audio, so without a gain the
+    voice is inaudible under the game or video being recorded.
+    """
+
+    args: list[str]
+    gain: float = 1.0
+
+
 class Source(NamedTuple):
     """Something that can be recorded, as offered to the user."""
 
@@ -83,6 +94,9 @@ class CaptureBackend(ABC):
         audio_device: str | None = None,
         mic: bool = False,
         mic_device: str | None = None,
+        audio_gain: float = 1.0,
+        mic_gain: float = 1.0,
+        app_audio: str | None = None,
     ) -> None:
         self.output = Path(output)
         self.fps = fps
@@ -102,6 +116,9 @@ class CaptureBackend(ABC):
         self.want_mic = mic
         self.mic_device = mic_device
         self.mic_error: str | None = None
+        self.audio_gain = audio_gain
+        self.mic_gain = mic_gain
+        self.app_audio = app_audio
         # ponytail: fixed A/V nudge in seconds; per-machine calibration knob.
         # Raise it if audio runs early, lower it if audio runs late.
         self.audio_offset = audio_offset
@@ -119,11 +136,11 @@ class CaptureBackend(ABC):
     def video_input_args(self) -> list[str]:
         """ffmpeg args opening this platform's screen capture device."""
 
-    def audio_inputs(self) -> list[list[str]]:
+    def audio_inputs(self) -> list[AudioInput]:
         """ffmpeg args for each audio input this platform can capture directly.
 
-        One list per input, so the caller knows how many there are and can mix
-        them. Empty means either that there is no audio, or that it comes from
+        One entry per input, so the caller knows how many there are and can mix
+        them at the right levels. Empty means either that there is no audio, or that it comes from
         a side recorder instead (Windows system audio).
         """
         return []
@@ -137,23 +154,30 @@ class CaptureBackend(ABC):
         inputs = self.audio_inputs()
         args = FFMPEG_BASE + self.video_input_args()
         for one in inputs:
-            args += one
+            args += one.args
 
         if len(inputs) > 1:
             # -vf and -filter_complex cannot both be used, so when several audio
             # inputs have to be mixed the video filter moves into the complex
             # graph as well.
+            chains, taps = [], []
+            for number, one in enumerate(inputs, start=1):
+                if one.gain != 1.0:
+                    chains.append(f"[{number}:a]volume={one.gain}[g{number}]")
+                    taps.append(f"[g{number}]")
+                else:
+                    taps.append(f"[{number}:a]")
             # normalize=0 keeps each source at its own level; amix otherwise
             # scales every input by 1/n, which measurably quietens system audio
             # the moment a microphone is added.
-            taps = "".join(f"[{n}:a]" for n in range(1, len(inputs) + 1))
-            graph = (
-                f"[0:v]{','.join(self.video_filters())}[vout];"
-                f"{taps}amix=inputs={len(inputs)}:duration=longest:normalize=0[aout]"
-            )
+            graph = f"[0:v]{','.join(self.video_filters())}[vout];"
+            graph += "".join(chain + ";" for chain in chains)
+            graph += "".join(taps) + f"amix=inputs={len(inputs)}:duration=longest:normalize=0[aout]"
             args += ["-filter_complex", graph, "-map", "[vout]", "-map", "[aout]"]
         else:
             args += ["-vf", ",".join(self.video_filters())]
+            if inputs and inputs[0].gain != 1.0:
+                args += ["-af", f"volume={inputs[0].gain}"]
 
         args += ["-c:v", "libx264", "-preset", self.preset, "-crf", str(self.crf),
                  "-pix_fmt", "yuv420p"]
@@ -173,10 +197,24 @@ class CaptureBackend(ABC):
     def recording(self) -> bool:
         return self._proc is not None
 
+    def setup(self) -> None:
+        """Prepare anything the capture needs, before the first segment.
+
+        Whatever this changes on the system must be undone by `teardown`.
+        """
+
+    def teardown(self) -> None:
+        """Undo `setup`. Always called, even when recording failed."""
+
     def start(self) -> None:
         if self.recording:
             raise RuntimeError("already recording")
-        self._start_segment()
+        self.setup()
+        try:
+            self._start_segment()
+        except Exception:
+            self.teardown()
+            raise
 
     def pause(self) -> None:
         if not self.recording:
@@ -190,6 +228,7 @@ class CaptureBackend(ABC):
 
     def stop(self) -> Path:
         self._end_segment()
+        self.teardown()
         parts = [
             self._mux(i, video, audio)
             for i, (video, audio) in enumerate(self._segments)
@@ -252,13 +291,20 @@ class CaptureBackend(ABC):
         merged = self.workdir / f"mux{index}.mkv"
         offset = ["-itsoffset", str(self.audio_offset)] if self.audio_offset else []
         args = ["-i", str(video), *offset, "-i", str(audio)]
+        # The side recording is always system audio, so it carries audio_gain.
+        level = f"volume={self.audio_gain}" if self.audio_gain != 1.0 else None
         if self.audio_inputs():
             # The segment already carries a track (a microphone, say), so the
             # side recording has to be mixed with it rather than replace it.
+            wav = f"[1:a]{level}[sys];" if level else ""
+            tap = "[sys]" if level else "[1:a]"
             args += [
-                "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0[aout]",
+                "-filter_complex",
+                f"{wav}[0:a]{tap}amix=inputs=2:duration=longest:normalize=0[aout]",
                 "-map", "0:v", "-map", "[aout]",
             ]
+        elif level:
+            args += ["-filter:a", level]
         args += ["-c:v", "copy", "-c:a", "aac", str(merged)]
         _run(args)
         return merged
