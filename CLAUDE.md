@@ -4,20 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-All six phases of `plan.md` are implemented, plus microphone capture, audio levels, per-application audio and an arrow-key settings editor added afterwards. Nothing has been pushed or published yet. The remote is `github.com/Yefee8/yefees-recorder`, but nothing has been pushed to it and nothing has been published — neither workflow has ever run.
+All six phases of `plan.md` are implemented, plus microphone capture, audio levels, per-application audio and an arrow-key settings editor added afterwards. `main` is pushed to `github.com/Yefee8/yefees-recorder` and CI runs on it; the release workflow has never run and nothing has been published, because there is no tag yet.
 
 Verification status per platform:
 
 | | Screen capture | Audio | Where it is proven |
 |---|---|---|---|
 | Windows | verified on real hardware | verified on real hardware | local runs; `tests/test_windows.py` |
-| Linux X11 | verified in CI | **never run** | `tests/test_linux_capture.py` under Xvfb |
+| Linux X11 | **failing in CI** | **never run** | `tests/test_linux_capture.py` under Xvfb |
 | Linux Wayland | **never run** | **never run** | command construction only |
 | macOS | verified on real hardware (14.5, ffmpeg 8.1.2) | verified on real hardware | local runs; `tests/test_macos.py` |
 
-**Linux X11's "verified in CI" covers capture and nothing else, and no CI run has actually happened yet.** The macOS session found two bugs in `keys.py` that break every menu on POSIX (see "Hotkeys"), and Xvfb would not have caught either — the capture test does not press a key. Assume the same of Linux's audio: nobody has heard it.
+**Linux X11 was never verified; the test that would have verified it is red.** `test_x11grab_records_the_actual_display` paints the root window red and captures it, and under Xvfb it gets back `(1, 0, 2)` — black. It has failed every run, including the ones from before the macOS work, so this is not a regression and it is not new. It is also the test doing exactly what it was written for: a broken recorder here produces a valid file full of black frames rather than an error. **Fixing it needs a Linux machine to measure on — do not guess at it from another platform.**
 
-Wayland remains unproven; treat a first real run there as a debugging session. So does Linux X11 audio.
+That test covers capture and nothing else, so Linux audio is unproven too: nobody has heard it. The macOS session found two bugs in `keys.py` that break every menu on POSIX (see "Hotkeys"), and Xvfb would not have caught either, because the capture test does not press a key.
+
+Wayland remains unproven; treat a first real run there as a debugging session.
 
 `plan.md` (gitignored, Turkish) holds the phase order and remains the roadmap, **but its central technical premise turned out to be wrong — see "Why not mpv" below.** Trust this file over `plan.md` on engine choice.
 

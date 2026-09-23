@@ -117,6 +117,10 @@ def test_a_wav_that_starts_late_is_padded_up_to_the_first_frame(tmp_path):
 def test_start_twice_is_an_error(tmp_path):
     backend = FakeBackend(tmp_path / "out.mp4", fps=10, audio=False)
     backend.start()
+    # stop() refuses a recording with nothing in it, and the cleanup below is
+    # not what this test is about. A matroska file stays empty on disk until
+    # ffmpeg flushes, so there is nothing to watch for - only time to give it.
+    time.sleep(2)
     try:
         with pytest.raises(RuntimeError):
             backend.start()
