@@ -8,14 +8,16 @@ All six phases of `plan.md` are implemented, plus microphone capture, audio leve
 
 Verification status per platform:
 
-| | Screen capture | Where it is proven |
-|---|---|---|
-| Windows | verified on real hardware | local runs; `tests/test_windows.py` |
-| Linux X11 | verified in CI | `tests/test_linux_capture.py` under Xvfb |
-| Linux Wayland | **never run** | command construction only |
-| macOS | **never run** — a hosted runner cannot hold Screen Recording permission | parser smoke test only |
+| | Screen capture | Audio | Where it is proven |
+|---|---|---|---|
+| Windows | verified on real hardware | verified on real hardware | local runs; `tests/test_windows.py` |
+| Linux X11 | verified in CI | **never run** | `tests/test_linux_capture.py` under Xvfb |
+| Linux Wayland | **never run** | **never run** | command construction only |
+| macOS | verified on real hardware (14.5, ffmpeg 8.1.2) | verified on real hardware | local runs; `tests/test_macos.py` |
 
-Wayland and macOS capture remain unproven; treat a first real run on either as a debugging session.
+**Linux X11's "verified in CI" covers capture and nothing else, and no CI run has actually happened yet.** The macOS session found two bugs in `keys.py` that break every menu on POSIX (see "Hotkeys"), and Xvfb would not have caught either — the capture test does not press a key. Assume the same of Linux's audio: nobody has heard it.
+
+Wayland remains unproven; treat a first real run there as a debugging session. So does Linux X11 audio.
 
 `plan.md` (gitignored, Turkish) holds the phase order and remains the roadmap, **but its central technical premise turned out to be wrong — see "Why not mpv" below.** Trust this file over `plan.md` on engine choice.
 
@@ -53,12 +55,14 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 
 ## Architecture
 
-`capture.py` owns the whole recording lifecycle; a backend subclass only answers *what* to capture. To add Linux or macOS, implement `video_input_args()` (and `make_audio_recorder()` if the platform has system audio) and register it in `get_backend()` — nothing else should need touching.
+`capture.py` owns the whole recording lifecycle; a backend subclass only answers *what* to capture. A new platform implements `video_input_args()` (and `make_audio_recorder()` if its audio cannot ride along with the screen) and registers itself in `get_backend()` — nothing else should need touching.
+
+The other hooks all default to "do what everyone else does", and exist because one platform measured differently: `video_filters()` (macOS crops a region after the fact), `output_options()` and `limits_duration` (macOS lets ffmpeg count the duration), `audio_lead()` and `side_audio_filters()` (macOS lines its wav up with the first frame and has already applied its gains), `setup()`/`teardown()` (Linux per-application audio) and `stop_signal` (Wayland is not ffmpeg). Adding a platform-specific argument belongs in a hook like these, not in an `if platform ==` inside `capture.py`.
 
 - **ffmpeg is not bundled** into the pip package (size + GPL licensing). `doctor` checks for it and prints the OS-appropriate install command.
-- **Pause is implemented as segmentation.** ffmpeg has no pause. `pause()` ends the current ffmpeg process, `resume()` starts a new one, and `stop()` muxes each segment with its audio and concatenates them with `-c copy`. Wall-clock time spent paused therefore never reaches the output. Nothing calls `pause()` yet — hotkeys are phase 4; it is exercised by tests.
+- **Pause is implemented as segmentation.** ffmpeg has no pause. `pause()` ends the current ffmpeg process, `resume()` starts a new one, and `stop()` muxes each segment with its audio and concatenates them with `-c copy`. Wall-clock time spent paused therefore never reaches the output. Verified on macOS through a real terminal: 14.0s of wall clock with 3s of it paused produced 8.99s of video, and a beep train kept its spacing on both sides of the seam. **Every segment restarts the capture devices**, so each one pays the startup cost again and gets its own audio alignment — that is where the macOS lead correction earns its keep.
 - **Segments are `.mkv` internally** (survives an abrupt kill) and only the final concat writes the user's chosen extension.
-- **Audio arrives two ways, and Windows uses both at once.** `audio_inputs()` returns one argument list per input ffmpeg can capture directly; `make_audio_recorder()` returns a side recorder whose wav is muxed in on stop. Linux and macOS put system audio *and* the microphone through `audio_inputs()`. Windows can only put the **microphone** there (dshow records mics fine, it just has no loopback), so system audio stays a side recorder and the two are mixed at mux time.
+- **Audio arrives two ways, and Windows uses both at once.** `audio_inputs()` returns one argument list per input ffmpeg can capture directly; `make_audio_recorder()` returns a side recorder whose wav is muxed in on stop. Linux puts system audio *and* the microphone through `audio_inputs()`. Windows can only put the **microphone** there (dshow records mics fine, it just has no loopback), so system audio stays a side recorder and the two are mixed at mux time. macOS puts *everything* in the side recorder for a different reason again — its capture sessions starve each other.
 - **Per-application audio only works on Linux.** `setup()`/`teardown()` on `CaptureBackend` exist for it: the Linux backend loads a null sink plus a `module-loopback` back to the real output (without that second module the user stops hearing the app they are recording), moves the app's sink-input across, and unloads both on stop. `teardown()` runs even when `start()` fails. Windows would need the process-loopback API and macOS Core Audio process taps, neither reachable through ffmpeg, so both raise an error naming the routing workaround instead.
 - **Microphone gain is not cosmetic.** A mic sits roughly 30 dB below system audio, so without `mic_gain` a voice is inaudible in the mix even though it is recorded correctly. Verified against a synthetic tone: gain 2 gives exactly +6.0 dB, gain 4 gives +12.0 dB.
 - **`amix` must be given `normalize=0`.** By default it scales every input by 1/n, so switching the microphone on quietens system audio — measured at 4.4 dB (mean −8.6 → −13.0 dB). Both mix sites set it, and a test pins it.
@@ -67,12 +71,93 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 - **Record the sink's `.monitor`, not the default source** — the plain default PulseAudio source is the microphone, not system audio.
 - **The loopback wav is built against wall clock, not against the device.** Windows only feeds a loopback stream while something is actually playing — on a fully silent machine the callback never fires at all, and mid-recording silence produces gaps. `WasapiLoopbackRecorder` therefore pads with real silence up to the elapsed-time position on every callback and again at stop. Removing that padding silently desyncs audio from video. Measured after the fix: beeps 4.000 s apart in the source land 3.998 / 4.001 / 3.998 s apart in the output.
 - **`--audio-offset` is a deliberate calibration knob**, not dead config: residual constant A/V offset depends on how fast a given machine's audio endpoint spins up.
-- **macOS records black frames rather than erroring when Screen Recording permission is missing.** `screen_recording_permitted()` checks `CGPreflightScreenCaptureAccess` through ctypes (no dependency) before capture starts. It returns `None` when it cannot tell — treat only an explicit `False` as denied, or non-macOS machines would refuse to record. Granting permission only affects newly launched processes, so the terminal has to be restarted.
+- **macOS hands back nothing at all when Screen Recording permission is missing** — not the black frames this used to claim. Measured on 14.5: the device opens, no frame ever arrives, and ffmpeg waits for one indefinitely. After 120s there was no output file, so there is nothing to salvage and nothing to notice. `screen_recording_permitted()` checks `CGPreflightScreenCaptureAccess` through ctypes (no dependency) before capture starts. It returns `None` when it cannot tell — treat only an explicit `False` as denied, or non-macOS machines would refuse to record. Granting permission only affects newly launched processes, so the terminal has to be restarted.
 - **macOS has no native system-audio loopback** — it needs a virtual device like BlackHole, which appears as an avfoundation *input*. Missing one downgrades to video-only rather than failing.
-- **avfoundation uses two separate inputs**, `screen:none` and `none:audio`, not the combined `screen:audio` form, which drifts between the streams.
+- **avfoundation addresses a device as `video:audio`**, and the screen is always opened as `screen:none` — the combined `screen:audio` form drifts between the streams. Audio is not opened in that process at all; see "macOS audio" below.
 - **Device indices are discovered, never hardcoded** — `-list_devices` writes to stderr and exits non-zero by design, so the exit code is ignored and stderr is parsed. The camera is usually index 0 and the screen 1, and the microphone sits at audio 0 ahead of the loopback device, so picking index 0 gets you a webcam and a mic.
 - **Wayland source selection cannot be automated** — the `xdg-desktop-portal` dialog is an OS security boundary and the user must pick the screen/window there.
 - Backend selection is `platform.system()` plus `XDG_SESSION_TYPE` on Linux, in `get_backend()`.
+
+## macOS audio (measured, do not retry)
+
+The first real run of this backend found three separate faults in the audio
+path, each measured against a 1 kHz beep played into BlackHole once a second.
+Every one of them produces a plausible file, so none announce themselves.
+
+- **avfoundation delivers honest timestamps with samples missing between them.**
+  A 6.4s capture held 4.80s of audio; ffmpeg's own accounting said
+  `time=00:00:08.08` over 305,152 samples, which is 6.36s. Decoding what arrives
+  packs the sound into three quarters of the recording and walks it out of sync
+  with the picture — beeps a second apart came back 0.75s apart. Every audio
+  input therefore carries `aresample=async=1` (`AUDIO_GAP_FILLER`), which is the
+  same hole Windows fills by padding its loopback wav against the clock.
+- **Two avfoundation inputs cannot share an ffmpeg process.** Captured alone the
+  audio keeps all eight beeps and their spacing; put the screen in the same
+  ffmpeg and two ragged fragments come back, because the capture session
+  starves. `-thread_queue_size 4096` changes nothing — measured, identical
+  output. Two *audio* inputs share a process perfectly well, which is why
+  `AvfAudioRecorder` exists: one process for what is seen, one for everything
+  that is heard.
+- **amix cannot mix these streams live either.** With it between the devices and
+  the file, whole beeps arrive as 50ms fragments, with or without
+  `dropout_transition=0`. Each device is written to its own wav and they are
+  mixed once they are finished, in `AvfAudioRecorder._combine`. A single device
+  skips the pass entirely and is renamed.
+
+**Audio needs Microphone permission, and Screen Recording does not cover it.**
+macOS gates every audio *input* behind it, virtual devices included, so a
+terminal with screen access can still be refused BlackHole - which is exactly
+what happened the first time this was run outside the session that developed it.
+ffmpeg says `Failed to create AV capture input device: Cannot use <device>` and
+exits. Because the audio lives in a process of its own now, that failure does
+not stop the recording and nothing noticed it: the screen kept going and the
+file came out silent. `AvfAudioRecorder.verdict()` reports it and `check_audio()`
+puts it on `audio_error`/`mic_error`.
+
+**That check is polled, not waited for.** Measured against one refused device,
+the process died 0.14s into one attempt and 1.07s into the next, so there is no
+pause before "Recording" that both catches it and goes unnoticed - and on a
+resume the user would feel every one of those seconds. The wait loop asks once
+per pass instead, and `_report_problems` prints each complaint once. The
+recorder's stderr goes to a file beside its wav rather than a pipe, because
+nothing drains it while a recording runs.
+
+**The wav and the video do not start together, and which one is first varies.**
+The audio device opened 0.74s *before* the screen on a first segment and 1.02s
+*after* it on a segment following a pause, on the same machine. Both are stopped
+within milliseconds of each other by design (see the comment in
+`_end_segment`), so whatever length one has over the other it has at the front,
+and `audio_lead()` measures it per segment. A positive lead is seeked past with
+`-ss`; a negative one is padded with real silence via `adelay`, because the
+segments are concatenated with `-c copy` afterwards and a gap in the timestamps
+is the muxer's to interpret while samples are not. Left alone this accumulates:
+one pause put the sound 0.85s ahead of the picture.
+
+Do not replace any of this with a constant. The numbers above moved by a factor
+of two between runs on one machine, because a cold device opens slower than a
+warm one.
+
+## Duration on macOS
+
+`--duration` is counted by ffmpeg, not by the caller: `MacBackend` sets
+`limits_duration` and `output_options()` adds `-t`. avfoundation takes 1.3s to
+hand over its first frame, and a duration timed from launch loses every one of
+those seconds — `-d 5` measured 4.00s of video. With `-t` it measures 4.93s, a
+constant two frames short. After a pause the next segment asks for what is left,
+or `-t` would start the whole duration over.
+
+Two other signals were tried and rejected:
+
+- **the frame counter in `-progress`** counts *encoded* frames, so it trails the
+  capture by x264's lookahead — 0.53s at 30fps but 1.51s at 10fps. Waiting on it
+  made a 2s recording 5.1s long.
+- **the output file appearing** is no good either: on a 3s capture the matroska
+  header does not land until 3.37s.
+
+Because the recorder stops itself, the wait loop watches for that
+(`capture_ended`) instead of timing it, and `STARTUP_GRACE` only exists as a
+backstop. Windows, X11 and Wayland keep the old wall-clock path — `-t` there
+would change how `--duration` ends on platforms this was not measured on.
 
 ## Source selection
 
@@ -88,7 +173,9 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 Things that bite here:
 
 - **Windows window enumeration must skip DWM-cloaked windows.** Suspended UWP apps (Settings, Movies & TV) stay `IsWindowVisible`, so without the `DWMWA_CLOAKED` check the picker fills with duplicate entries for apps that aren't on screen — measured: 18 raw windows down to 11 real ones.
-- **avfoundation video index 0 is usually a webcam and audio index 0 a microphone.** `--display N` counts screens, not devices, and is mapped through `screen_device_indices()`.
+- **avfoundation video index 0 is usually a webcam, and audio index 0 is whatever was installed most recently.** `--display N` counts screens, not devices, and is mapped through `screen_device_indices()`. The audio order is not fixed either: on the test machine the built-in microphone sat at 0 until BlackHole was installed and took that slot. Nothing may key off an index, which is why `find_loopback_device` matches names and `find_microphone` works by elimination.
+- **Device names are localised and "Capture screen" is not.** On a Turkish desktop the camera reads `FaceTime HD Kamera` and the microphone `MacBook Air Mikrofonu`, while the screens stay English. That is the one name anything relies on, and `tests/test_macos.py` has a localised sample pinning it.
+- **macOS `--region` is in backing pixels.** avfoundation captures at the display's real resolution, so `--region 0,0,640x480` on a Retina screen covers 320x240 points. Confirmed against `screencapture`, which produces a frame of exactly the same size — 3420x2224 for a 1710x1112 desktop. The README says so rather than the numbers being silently doubled.
 - **Monitor offsets can be negative** on both Windows and X11 when a monitor sits left of or above the primary, so `parse_region` and the xrandr regex both accept a leading `-`.
 - **`--window` with x11grab must not also pass `-video_size`** — the window's own size wins.
 
@@ -98,8 +185,9 @@ Quality is `low`/`balanced`/`high` mapping to an x264 preset plus CRF. Even `hig
 
 **`blessed` is deliberately not a dependency, despite `plan.md` naming it.** Measured on Windows: `Terminal.inkey(timeout=0.5)` returns an empty key after 0.00s and ignores the timeout entirely, including for piped input — `cbreak()` silently degrades to a no-op because there is no `termios`. A wait loop built on it would spin at full CPU and never see a keypress. `keys.py` uses `msvcrt.kbhit`/`getwch` on Windows and `termios`/`tty`/`select` elsewhere, which is roughly the same amount of code with no dependency.
 
-- `read_key` **must** honour its timeout — there is a test asserting it, because that is exactly what blessed got wrong.
-- `raw_mode()` is a no-op on Windows (the console is already unbuffered) and restores termios through a `finally` elsewhere.
+- `read_key` **must** honour its timeout — there are two tests asserting it, because that is exactly what blessed got wrong, and `keys.py` managed to reproduce it anyway. A terminal that goes away leaves the descriptor readable and empty for good while select keeps saying ready: measured at 382,637 calls a second against the five a 0.2s timeout allows. `_read_posix` waits the timeout out when a read comes back empty.
+- **Never read stdin through `sys.stdin` here.** The buffered stream pulls a whole chunk out of the kernel and hands back one character, leaving the rest where `select` cannot see it. Every arrow key therefore read as a bare Esc — which backs out of a menu — and the `[` and the letter surfaced as the next two keypresses, so the stream never recovered. Measured on a pty, five presses in a row returned `esc`, `[`, `B`, `esc`, `[`; `config --edit` quit on the first Down. `_read_char` uses `os.read` on the descriptor so select and the reader look at the same place, and decodes a UTF-8 lead byte's continuations so a Turkish character stays one keypress. This was invisible for the whole project's life: Windows uses `msvcrt`, which does not buffer, and every menu test replaces `read_key`. `test_keys_decode_off_a_real_terminal` drives a pty instead.
+- `raw_mode()` is a no-op on Windows (the console is already unbuffered), and also when stdin has no descriptor behind it — a captured stdin says yes to `isatty()` and raises on `fileno()`, which took out 27 tests the first time the suite ran on a Mac. It restores termios through a `finally` otherwise.
 - Ctrl+C still works: `tty.setcbreak` leaves signal handling on, unlike raw mode.
 - `_run_until_stopped` swallows `KeyboardInterrupt` so the file still gets finalised, and catches `RuntimeError` from pause/resume so a refused toggle cannot kill a recording in progress.
 
@@ -171,7 +259,8 @@ Prefer plain ASCII in strings this project controls; the em dash was removed fro
 
 - **`pyaudiowpatch` is marked `sys_platform == 'win32'`.** It publishes Windows-only wheels, so without the marker Linux and macOS try to build PyAudio from source and the install fails.
 - **The Linux job runs pytest under `xvfb-run`.** That `DISPLAY` is the entire reason `tests/test_linux_capture.py` executes rather than skipping — it paints the root window red with `xsetroot` and asserts the captured frames are actually red, because a recorder failure here yields a valid file full of black frames, not an error.
-- **The macOS `doctor` step is allowed to fail.** A hosted runner cannot be granted Screen Recording permission, so `doctor` correctly exits non-zero there. Don't "fix" that by weakening `doctor`.
+- **The macOS `doctor` step is allowed to fail.** A hosted runner cannot be granted Screen Recording permission, so `doctor` correctly exits non-zero there. Don't "fix" that by weakening `doctor`. The *tests* must still pass, which is why `test_doctor_passes_when_tools_present` stubs the permission check rather than depending on the machine.
+- **What CI can and cannot catch.** Everything that needs a keyboard, a real audio device or Screen Recording permission is outside its reach. The arrow-key and busy-spin bugs in `keys.py` lived through the whole project because every test replaced `read_key`; `test_keys_decode_off_a_real_terminal` closes that particular hole with a pty, but nothing covers the menus end to end. A change to `menu.py` or `editor.py` still wants a person at a terminal.
 - `uv sync --locked` fails the build if `pyproject.toml` changed without relocking.
 
 ## Releasing

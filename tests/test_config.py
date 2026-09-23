@@ -66,6 +66,12 @@ def test_audio_false_in_the_file_survives_resolution():
 def fake_backend(monkeypatch):
     class Fake:
         audio_error = None
+        # Read by the wait loop: whether it times itself, and whether it is done.
+        limits_duration = False
+        capture_ended = False
+
+        def check_audio(self):
+            pass
 
         def __init__(self, output, **kwargs):
             self.kwargs = kwargs

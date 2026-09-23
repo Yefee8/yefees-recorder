@@ -37,6 +37,11 @@ QUALITY_PRESETS = {
 
 REGION = re.compile(r"^\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*x\s*(\d+)\s*$")
 
+# How long past its duration to let a self-timing recorder finish before giving
+# up on it. It stops later than a clock started at launch would, because it
+# counts from its first captured frame - which is the entire point of it.
+STARTUP_GRACE = 10.0
+
 
 class AudioInput(NamedTuple):
     """One ffmpeg audio input, with the gain to apply before mixing.
@@ -97,6 +102,7 @@ class CaptureBackend(ABC):
         audio_gain: float = 1.0,
         mic_gain: float = 1.0,
         app_audio: str | None = None,
+        duration: float = 0.0,
     ) -> None:
         self.output = Path(output)
         self.fps = fps
@@ -119,6 +125,10 @@ class CaptureBackend(ABC):
         self.audio_gain = audio_gain
         self.mic_gain = mic_gain
         self.app_audio = app_audio
+        # Seconds to capture, 0 meaning "until stopped". Only a backend that
+        # sets `limits_duration` acts on it; for the rest the caller times the
+        # recording from the outside, as it always has.
+        self.duration = duration
         # ponytail: fixed A/V nudge in seconds; per-machine calibration knob.
         # Raise it if audio runs early, lower it if audio runs late.
         self.audio_offset = audio_offset
@@ -132,6 +142,12 @@ class CaptureBackend(ABC):
     # How to ask the capture process to finish. None means ffmpeg: write "q" to
     # its stdin. Anything else is a signal number to send instead.
     stop_signal = None
+
+    # Whether the recorder enforces `duration` itself. A device that is slow to
+    # wake up makes a duration timed from launch come out short, so a backend
+    # that can count from its first captured frame says so here and the caller
+    # waits for it to finish instead of stopping it on a clock.
+    limits_duration = False
 
     @abstractmethod
     def video_input_args(self) -> list[str]:
@@ -149,6 +165,10 @@ class CaptureBackend(ABC):
     def video_filters(self) -> list[str]:
         """Filters applied to the captured video, innermost first."""
         return [EVEN_DIMS]
+
+    def output_options(self) -> list[str]:
+        """Extra ffmpeg options for the segment, just before its file name."""
+        return []
 
     def capture_command(self, output: Path) -> list[str]:
         """The full command recording one segment to `output`."""
@@ -184,7 +204,26 @@ class CaptureBackend(ABC):
                  "-pix_fmt", "yuv420p"]
         if inputs:
             args += ["-c:a", "aac"]
-        return args + [str(output)]
+        return args + self.output_options() + [str(output)]
+
+    def audio_lead(self, video: Path, audio: Path) -> float:
+        """Seconds by which a side recording starts before the video does.
+
+        Negative when it starts after the video instead. Zero unless a backend's
+        audio device and capture device wake up at noticeably different speeds,
+        in which case the wav has to be lined up with the first frame before the
+        two are muxed together.
+        """
+        return 0.0
+
+    def side_audio_filters(self) -> list[str]:
+        """Filters for a side recording as it is muxed back in.
+
+        On Windows the side recording is system audio and nothing else, so it
+        carries `audio_gain` here. A backend whose recorder already mixed its
+        devices at their own levels returns nothing instead.
+        """
+        return [f"volume={self.audio_gain}"] if self.audio_gain != 1.0 else []
 
     def make_audio_recorder(self):
         """A side recorder for audio ffmpeg cannot capture, or None.
@@ -197,6 +236,11 @@ class CaptureBackend(ABC):
     @property
     def recording(self) -> bool:
         return self._proc is not None
+
+    @property
+    def capture_ended(self) -> bool:
+        """Whether the capture process stopped on its own rather than paused."""
+        return self._proc is not None and self._proc.poll() is not None
 
     def setup(self) -> None:
         """Prepare anything the capture needs, before the first segment.
@@ -267,6 +311,25 @@ class CaptureBackend(ABC):
         )
         self._segments.append((video, audio))
 
+    def check_audio(self) -> None:
+        """Ask a side recorder whether its device ever let it start.
+
+        Polled while the recording runs rather than waited for at the start: a
+        device that refuses can take anywhere from a seventh of a second to over
+        a second to say so. A failure is reported and not raised - the screen is
+        still worth having, and `_mux` already treats a missing wav as "video
+        only" - and whichever source was asked for carries the message, since
+        one recorder covers both.
+        """
+        verdict = getattr(self._audio, "verdict", None)
+        failure = verdict() if verdict else None
+        if not failure:
+            return
+        if self.want_audio:
+            self.audio_error = failure
+        else:
+            self.mic_error = failure
+
     def _end_segment(self) -> None:
         if self._proc is None:
             if self._audio is not None:
@@ -298,10 +361,19 @@ class CaptureBackend(ABC):
         if audio is None or not audio.exists() or audio.stat().st_size == 0:
             return video
         merged = self.workdir / f"mux{index}.mkv"
+        # A wav older than the first frame has its head seeked past - seeking a
+        # PCM file is exact. One that starts after the first frame is pushed
+        # back by real silence instead of a timestamp shift, because the parts
+        # are concatenated with -c copy afterwards and samples say what a gap in
+        # the timestamps only implies.
+        lead = self.audio_lead(video, audio)
+        head = ["-ss", f"{lead:.3f}"] if lead > 0 else []
         offset = ["-itsoffset", str(self.audio_offset)] if self.audio_offset else []
-        args = ["-i", str(video), *offset, "-i", str(audio)]
-        # The side recording is always system audio, so it carries audio_gain.
-        level = f"volume={self.audio_gain}" if self.audio_gain != 1.0 else None
+        args = ["-i", str(video), *head, *offset, "-i", str(audio)]
+        filters = list(self.side_audio_filters())
+        if lead < 0:
+            filters.insert(0, f"adelay=delays={-lead * 1000:.0f}ms:all=1")
+        level = ",".join(filters) or None
         if self.audio_inputs():
             # The segment already carries a track (a microphone, say), so the
             # side recording has to be mixed with it rather than replace it.

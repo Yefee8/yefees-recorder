@@ -1,6 +1,6 @@
 # yefees-recorder
 
-Cross-platform screen recorder CLI. Windows and Linux are implemented; macOS is not yet.
+Cross-platform screen recorder CLI for Windows, Linux and macOS.
 
 | Platform | Screen | System audio | Microphone |
 |---|---|---|---|
@@ -9,7 +9,8 @@ Cross-platform screen recorder CLI. Windows and Linux are implemented; macOS is 
 | Linux / Wayland | wf-recorder (wlroots only — not GNOME/KDE) | sink monitor | one source only |
 | macOS | avfoundation screen capture | BlackHole or similar virtual device | avfoundation |
 
-Only the Windows path has been tested on real hardware so far.
+Windows and macOS have been recorded on real hardware. Linux X11 runs its
+capture test in CI against a virtual display; Wayland has never been run at all.
 
 ffmpeg is not bundled; install it first:
 
@@ -114,12 +115,42 @@ whole screens, so use `--region` there).
 If audio ends up slightly ahead of or behind the video on your machine, nudge it
 with `--audio-offset 0.2`.
 
-On macOS you must grant Screen Recording permission to your terminal in System
-Settings > Privacy & Security, then restart it — without it macOS records black
-frames instead of reporting an error. System audio needs a loopback device
-(`brew install blackhole-2ch`); without one you get video only.
+### macOS
 
-On Wayland, ffmpeg cannot capture the screen — access is only available through
+Grant **Screen Recording** to your terminal in System Settings > Privacy &
+Security, then restart it — macOS only applies the change to newly launched
+processes. Without the grant avfoundation never delivers a single frame and
+ffmpeg waits for one forever, so `doctor` checks the permission before anything
+starts and `record` refuses rather than hanging.
+
+**Audio needs Microphone permission too**, in System Settings > Privacy &
+Security > Microphone, for the same terminal. macOS asks for it before handing
+over *any* audio input, virtual devices like BlackHole included, and without it
+the recording keeps the screen but has no sound — which the command says at the
+time rather than leaving you to discover it later.
+
+System audio needs a loopback device, because macOS has no way to record its own
+output:
+
+```
+brew install blackhole-2ch
+```
+
+Then open **Audio MIDI Setup**, create a *Multi-Output Device* containing both
+BlackHole and your speakers, and select it as the system output. Without the
+multi-output you record the sound but stop hearing it. With no loopback device
+at all you get video only, which the command says at the time.
+
+**`--region` is in pixels, not points.** avfoundation captures at the display's
+backing resolution, so on a Retina screen `--region 0,0,1280x720` covers the
+640x360 points you actually see. Double the numbers you read off Screenshot.
+
+`--window` is not available: avfoundation exposes whole screens and nothing
+smaller. Use `--region` for the area a window occupies.
+
+### Wayland
+
+ffmpeg cannot capture the screen there — access is only available through
 xdg-desktop-portal/PipeWire — so `wf-recorder` is required. It supports wlroots
 compositors (Sway, Hyprland, river). On GNOME or KDE, use your desktop's own
 recorder or run an X11 session.

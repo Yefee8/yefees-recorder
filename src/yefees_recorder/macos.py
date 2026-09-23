@@ -6,8 +6,10 @@ friends) that shows up as an *input* ffmpeg can read; without one, we record
 video only rather than failing.
 
 The trap worth knowing: without Screen Recording permission macOS does not
-error, it hands back black frames. So permission is checked up front via
-CoreGraphics instead of being discovered after a ruined recording.
+error. Measured on 14.5, the device opens and then never delivers a frame at
+all, so ffmpeg sits there forever and writes no file - worse than the black
+frames this was once assumed to produce. Permission is therefore checked up
+front via CoreGraphics rather than discovered after a ruined recording.
 """
 
 from __future__ import annotations
@@ -17,20 +19,44 @@ import re
 import subprocess
 from pathlib import Path
 
-from .capture import AudioInput, CaptureBackend, Source
+from .capture import FFMPEG_BASE, AudioInput, CaptureBackend, Source
 
 # Virtual output devices that loop system audio back to an input.
 LOOPBACK_DEVICE_HINTS = ("blackhole", "soundflower", "loopback audio", "ishowu", "multi-output")
 
 DEVICE_LINE = re.compile(r"\[(\d+)\]\s+(.+?)\s*$")
 
+# What AVCaptureScreenInput actually hands over. ffmpeg converts it to yuv420p
+# for the encoder; asking the device for yuv420p directly is what it refuses.
+SCREEN_PIXEL_FORMAT = "uyvy422"
+
+# A resumed segment is never asked for nothing: a duration that is already used
+# up would otherwise leave a zero-length file for the concat to choke on.
+MINIMUM_SEGMENT = 0.1
+
+# avfoundation hands over audio with honest timestamps but missing samples, so
+# the surviving ones have to be put back where they belong instead of being run
+# together. Measured on a 6.4s capture: 4.80s of audio without this, 5.98s with
+# it, and a beep train 1.000s apart that came out 0.75s apart lands at 1.000s.
+AUDIO_GAP_FILLER = "aresample=async=1"
+
 PERMISSION_HELP = (
-    "Screen Recording permission has not been granted, so macOS would record "
-    "black frames instead of your screen.\n"
+    "Screen Recording permission has not been granted, so macOS would hand "
+    "ffmpeg no frames at all and the recording would hang instead of failing.\n"
     "Grant it in System Settings > Privacy & Security > Screen Recording, tick the "
     "terminal app you are running this from, then run the command again.\n"
     "(macOS only applies the change to newly launched processes, so restart the "
     "terminal if it still fails.)"
+)
+
+AUDIO_DEVICE_HELP = (
+    "macOS would not open the audio device, so this recording has no sound. The "
+    "screen is still being captured.\n"
+    "Every audio input needs Microphone permission, virtual devices like "
+    "BlackHole included. Grant it in System Settings > Privacy & Security > "
+    "Microphone for the terminal you are running this from, then restart the "
+    "terminal - macOS only applies the change to newly launched processes.\n"
+    "ffmpeg said: {reason}"
 )
 
 BLACKHOLE_HELP = (
@@ -102,6 +128,20 @@ def list_sources() -> list[Source]:
     return sources
 
 
+def segment_seconds(path: Path) -> float:
+    """Seconds of video in a finished segment, or 0 when it cannot be read."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        return float(probe.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
 def find_microphone(audio_devices: dict[int, str]) -> int | None:
     """The first device that is not a loopback, i.e. a real input."""
     for index, name in sorted(audio_devices.items()):
@@ -136,7 +176,149 @@ def request_screen_recording() -> bool:
         return False
 
 
+class AvfAudioRecorder:
+    """Records macOS audio to a wav, in an ffmpeg process of its own.
+
+    Two avfoundation inputs cannot share a process. Measured against a beep a
+    second: captured on its own the audio keeps all eight beeps and their exact
+    spacing, but put the screen in the same ffmpeg and two ragged fragments come
+    back - the capture session starves. Two *audio* inputs share a process
+    perfectly well, so the split is one process for what is seen and one for
+    everything that is heard, and the wav is muxed back in on stop.
+    """
+
+    def __init__(self, inputs: list[AudioInput]) -> None:
+        self.inputs = inputs
+        self.error: str | None = None
+        self._proc: subprocess.Popen | None = None
+        self._target: Path | None = None
+        self._parts: list[Path] = []
+        self._log: Path | None = None
+
+    def parts_for(self, path: Path) -> list[Path]:
+        """Where each device is recorded before they are mixed together."""
+        return [path.with_name(f"{path.stem}-{number}.wav")
+                for number in range(len(self.inputs))]
+
+    def command(self, parts: list[Path]) -> list[str]:
+        """The command recording each device to a file of its own.
+
+        Every device gets its own output rather than being mixed on the way in.
+        amix cannot keep up with these devices: measured against a beep a
+        second, every beep arrives whole when each is written out on its own,
+        and comes back as 50 ms fragments with amix between them. Mixing the
+        finished files afterwards costs a fraction of a second and keeps them.
+        """
+        args = list(FFMPEG_BASE)
+        for one in self.inputs:
+            args += one.args
+        for number, (one, part) in enumerate(zip(self.inputs, parts)):
+            steps = [AUDIO_GAP_FILLER]
+            if one.gain != 1.0:
+                steps.append(f"volume={one.gain}")
+            args += ["-map", f"{number}:a", "-af", ",".join(steps),
+                     "-c:a", "pcm_s16le", str(part)]
+        return args
+
+    def mix_command(self, parts: list[Path], path: Path) -> list[str]:
+        """The command folding the finished per-device files into one."""
+        args = list(FFMPEG_BASE)
+        for part in parts:
+            args += ["-i", str(part)]
+        taps = "".join(f"[{number}:a]" for number in range(len(parts)))
+        # normalize=0 for the reason it is needed everywhere else: amix scales
+        # every input by 1/n unless told not to, so switching the microphone on
+        # would quieten the system audio.
+        return args + [
+            "-filter_complex",
+            f"{taps}amix=inputs={len(parts)}:duration=longest:normalize=0[out]",
+            "-map", "[out]", "-c:a", "pcm_s16le", str(path),
+        ]
+
+    def start(self, path: Path) -> None:
+        self._target = Path(path)
+        self._parts = self.parts_for(self._target)
+        # To a file rather than a pipe: nothing reads it while the recording
+        # runs, and a pipe nobody drains eventually blocks the writer.
+        self._log = self._target.with_suffix(".log")
+        with open(self._log, "wb") as log:
+            self._proc = subprocess.Popen(
+                self.command(self._parts), stdin=subprocess.PIPE, stderr=log)
+
+    def verdict(self) -> str | None:
+        """Why the recorder stopped, or None while it is still going.
+
+        Asked repeatedly rather than waited for. Measured, the same refused
+        device took the process down 0.14s into one attempt and 1.07s into the
+        next, so no wait before the recording starts both catches it and goes
+        unnoticed - and a silent recording nobody was told about is the worse
+        of the two failures.
+        """
+        if self._proc is None or self.error is not None:
+            return self.error
+        if self._proc.poll() is None:
+            return None
+        self.error = AUDIO_DEVICE_HELP.format(reason=self._complaint())
+        return self.error
+
+    def _complaint(self) -> str:
+        """What ffmpeg said went wrong, as close to the cause as it gets.
+
+        The *first* complaint is the useful one - "Cannot use BlackHole 2ch" -
+        and everything after it is the failure being passed back up the stack.
+        The ObjC runtime writes to the same stream without going through
+        ffmpeg's log, so its noise is dropped.
+        """
+        try:
+            lines = self._log.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return "nothing at all"
+        for line in lines:
+            if line.startswith("objc[") or "NSCamera" in line or not line.strip():
+                continue
+            return re.sub(r"^\[[^]]*\]\s*", "", line).strip()
+        return "nothing at all"
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.stdin.write(b"q")  # ffmpeg finalizes the wavs on "q"
+                self._proc.stdin.flush()
+                self._proc.wait(timeout=15)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                self._proc.kill()
+                self._proc.wait()
+            finally:
+                self._proc = None
+        self._combine()
+
+    def _combine(self) -> None:
+        """Leave one wav where the caller asked for it, whatever was recorded.
+
+        A device that produced nothing is dropped rather than silencing the
+        others, and no recording at all leaves no file, which the mux reads as
+        "video only".
+        """
+        if self._target is None:
+            return
+        usable = [p for p in self._parts if p.exists() and p.stat().st_size > 0]
+        self._parts = []
+        if not usable:
+            return
+        if len(usable) == 1:
+            usable[0].replace(self._target)
+            return
+        subprocess.run(self.mix_command(usable, self._target), capture_output=True)
+
+
 class MacBackend(CaptureBackend):
+    # ffmpeg counts -t from the first frame it captures, and avfoundation takes
+    # 1.3s to hand that over - a duration timed from launch loses every one of
+    # those seconds, measured as 4.0s of video for a 5s recording. Nothing
+    # outside ffmpeg can see when the device woke up, so ffmpeg is asked to do
+    # the counting.
+    limits_duration = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._devices = None
@@ -146,6 +328,14 @@ class MacBackend(CaptureBackend):
         if self._devices is None:
             self._devices = list_avfoundation_devices()
         return self._devices
+
+    def output_options(self) -> list[str]:
+        if not self.duration:
+            return []
+        # After a pause the next segment asks for what is left of the duration;
+        # handing it the whole of it again would overrun the recording.
+        done = sum(segment_seconds(video) for video, _ in self._segments)
+        return ["-t", f"{max(self.duration - done, MINIMUM_SEGMENT):.3f}"]
 
     def video_filters(self) -> list[str]:
         # avfoundation grabs a whole screen, so a region has to be cropped after.
@@ -178,6 +368,12 @@ class MacBackend(CaptureBackend):
         return [
             "-f", "avfoundation",
             "-framerate", str(self.fps),
+            # The demuxer asks for yuv420p by default, which no screen device
+            # offers, and ffmpeg then prints its fallback at *error* level on
+            # every single recording. Naming the format it would have settled on
+            # keeps the output quiet; measured, it costs nothing (1.30s to the
+            # first frame either way, against 1.39s for nv12).
+            "-pixel_format", SCREEN_PIXEL_FORMAT,
             "-capture_cursor", "1",
             "-i", f"{screen}:none",
         ]
@@ -203,8 +399,38 @@ class MacBackend(CaptureBackend):
             )
 
     def audio_inputs(self) -> list[AudioInput]:
-        # Separate avfoundation inputs rather than the combined "screen:audio"
-        # form, which drifts between the streams.
+        # Nothing is recorded alongside the screen: a second avfoundation input
+        # in that process starves the capture session. See AvfAudioRecorder.
+        return []
+
+    def side_audio_filters(self) -> list[str]:
+        # The recorder already mixed its devices at their own levels, so there
+        # is no gain left to apply to the wav.
+        return []
+
+    def audio_lead(self, video: Path, audio: Path) -> float:
+        """How far ahead of the first frame the wav starts, negative if behind.
+
+        Both are stopped within milliseconds of each other, so whatever length
+        one has over the other it has at the front. Which way it goes is not
+        fixed and neither is the size: opening the screen took 0.74s longer
+        than opening the audio device on a first segment, and the audio device
+        took 1.02s longer than the screen on the segment after a pause. Left
+        alone it accumulates, putting the sound a segment further out of step
+        with the picture at every pause.
+        """
+        return segment_seconds(audio) - segment_seconds(video)
+
+    def make_audio_recorder(self):
+        sources = self.audio_sources()
+        return AvfAudioRecorder(sources) if sources else None
+
+    def audio_sources(self) -> list[AudioInput]:
+        """The avfoundation audio devices to record, system audio first.
+
+        Separate inputs rather than the combined "screen:audio" form, which
+        drifts between the streams.
+        """
         inputs = []
         if self.want_audio:
             if self.audio_device:

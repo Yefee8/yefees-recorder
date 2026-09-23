@@ -52,6 +52,68 @@ def test_pause_skips_the_gap(tmp_path):
     assert duration_of(out) < 4.5  # ~3s of capture, not ~5s of wall clock
 
 
+def test_a_plain_backend_does_not_limit_its_own_duration(tmp_path):
+    """Only a backend whose device is slow to wake up needs ffmpeg to count; for
+    the rest the caller still times the recording, exactly as before."""
+    backend = FakeBackend(tmp_path / "out.mp4", duration=5, audio=False)
+    assert not backend.limits_duration
+    assert "-t" not in backend.capture_command(tmp_path / "s.mkv")
+
+
+def make_video(path, seconds):
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"testsrc=size=64x48:rate=10:duration={seconds}",
+         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(path)],
+        check=True,
+    )
+
+
+def make_wav(path, seconds):
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"sine=frequency=440:duration={seconds}", str(path)],
+        check=True,
+    )
+
+
+def muxed_with_lead(tmp_path, lead, video_seconds, wav_seconds):
+    """Mux a video and a wav whose start times are `lead` seconds apart."""
+    backend = FakeBackend(tmp_path / "out.mp4", audio=False)
+    backend.audio_lead = lambda video, audio: lead
+    video, wav = backend.workdir / "seg0.mkv", backend.workdir / "seg0.wav"
+    make_video(video, video_seconds)
+    make_wav(wav, wav_seconds)
+    merged = backend._mux(0, video, wav)
+    return duration_of(merged), audio_duration_of(merged)
+
+
+def audio_duration_of(path):
+    """Where the audio track ends. Matroska carries no per-stream duration, so
+    this is the end of its last packet."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+         "packet=pts_time,duration_time", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    start, length = (float(x) for x in out.stdout.split()[-1].split(","))
+    return start + length
+
+
+def test_a_wav_older_than_the_first_frame_has_its_head_removed(tmp_path):
+    """The recording device can open before the capture one, and then the sound
+    at the top of the wav happened before anything was on screen."""
+    video, audio = muxed_with_lead(tmp_path, 0.5, 2.0, 2.5)
+    assert abs(audio - video) < 0.15, "the extra half second should be gone"
+
+
+def test_a_wav_that_starts_late_is_padded_up_to_the_first_frame(tmp_path):
+    """The other way round the sound runs ahead of the picture, and without
+    this it would run a segment further ahead at every pause."""
+    video, audio = muxed_with_lead(tmp_path, -0.5, 2.0, 1.5)
+    assert abs(audio - video) < 0.15, "the missing half second should be silence"
+
+
 def test_start_twice_is_an_error(tmp_path):
     backend = FakeBackend(tmp_path / "out.mp4", fps=10, audio=False)
     backend.start()
