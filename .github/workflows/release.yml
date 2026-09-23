@@ -36,5 +36,10 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          # Not dist/* : uv writes a .gitignore in there to keep the build out
+          # of git, and it was uploaded to the v0.1.0 release as a 1-byte
+          # "default.gitignore" before this was narrowed.
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
           generate_release_notes: true
