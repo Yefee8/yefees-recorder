@@ -9,8 +9,9 @@ Cross-platform screen recorder CLI for Windows, Linux and macOS.
 | Linux / Wayland | wf-recorder (wlroots only — not GNOME/KDE) | sink monitor | one source only |
 | macOS | avfoundation screen capture | BlackHole or similar virtual device | avfoundation |
 
-Windows and macOS have been recorded on real hardware. Linux X11 runs its
-capture test in CI against a virtual display; Wayland has never been run at all.
+Windows and macOS have been recorded on real hardware. Linux X11 has not: its
+capture test runs in CI against a virtual display and currently fails there.
+Wayland has never been run at all.
 
 ffmpeg is not bundled; install it first:
 
