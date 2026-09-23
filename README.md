@@ -123,6 +123,12 @@ processes. Without the grant avfoundation never delivers a single frame and
 ffmpeg waits for one forever, so `doctor` checks the permission before anything
 starts and `record` refuses rather than hanging.
 
+**Audio needs Microphone permission too**, in System Settings > Privacy &
+Security > Microphone, for the same terminal. macOS asks for it before handing
+over *any* audio input, virtual devices like BlackHole included, and without it
+the recording keeps the screen but has no sound — which the command says at the
+time rather than leaving you to discover it later.
+
 System audio needs a loopback device, because macOS has no way to record its own
 output:
 

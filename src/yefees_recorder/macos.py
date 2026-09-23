@@ -49,6 +49,16 @@ PERMISSION_HELP = (
     "terminal if it still fails.)"
 )
 
+AUDIO_DEVICE_HELP = (
+    "macOS would not open the audio device, so this recording has no sound. The "
+    "screen is still being captured.\n"
+    "Every audio input needs Microphone permission, virtual devices like "
+    "BlackHole included. Grant it in System Settings > Privacy & Security > "
+    "Microphone for the terminal you are running this from, then restart the "
+    "terminal - macOS only applies the change to newly launched processes.\n"
+    "ffmpeg said: {reason}"
+)
+
 BLACKHOLE_HELP = (
     "No loopback audio device found, so system audio cannot be captured - macOS "
     "has no built-in way to record its own output.\n"
@@ -179,9 +189,11 @@ class AvfAudioRecorder:
 
     def __init__(self, inputs: list[AudioInput]) -> None:
         self.inputs = inputs
+        self.error: str | None = None
         self._proc: subprocess.Popen | None = None
         self._target: Path | None = None
         self._parts: list[Path] = []
+        self._log: Path | None = None
 
     def parts_for(self, path: Path) -> list[Path]:
         """Where each device is recorded before they are mixed together."""
@@ -226,7 +238,46 @@ class AvfAudioRecorder:
     def start(self, path: Path) -> None:
         self._target = Path(path)
         self._parts = self.parts_for(self._target)
-        self._proc = subprocess.Popen(self.command(self._parts), stdin=subprocess.PIPE)
+        # To a file rather than a pipe: nothing reads it while the recording
+        # runs, and a pipe nobody drains eventually blocks the writer.
+        self._log = self._target.with_suffix(".log")
+        with open(self._log, "wb") as log:
+            self._proc = subprocess.Popen(
+                self.command(self._parts), stdin=subprocess.PIPE, stderr=log)
+
+    def verdict(self) -> str | None:
+        """Why the recorder stopped, or None while it is still going.
+
+        Asked repeatedly rather than waited for. Measured, the same refused
+        device took the process down 0.14s into one attempt and 1.07s into the
+        next, so no wait before the recording starts both catches it and goes
+        unnoticed - and a silent recording nobody was told about is the worse
+        of the two failures.
+        """
+        if self._proc is None or self.error is not None:
+            return self.error
+        if self._proc.poll() is None:
+            return None
+        self.error = AUDIO_DEVICE_HELP.format(reason=self._complaint())
+        return self.error
+
+    def _complaint(self) -> str:
+        """What ffmpeg said went wrong, as close to the cause as it gets.
+
+        The *first* complaint is the useful one - "Cannot use BlackHole 2ch" -
+        and everything after it is the failure being passed back up the stack.
+        The ObjC runtime writes to the same stream without going through
+        ffmpeg's log, so its noise is dropped.
+        """
+        try:
+            lines = self._log.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return "nothing at all"
+        for line in lines:
+            if line.startswith("objc[") or "NSCamera" in line or not line.strip():
+                continue
+            return re.sub(r"^\[[^]]*\]\s*", "", line).strip()
+        return "nothing at all"
 
     def stop(self) -> None:
         if self._proc is not None:

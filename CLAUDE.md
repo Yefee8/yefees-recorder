@@ -104,6 +104,24 @@ Every one of them produces a plausible file, so none announce themselves.
   mixed once they are finished, in `AvfAudioRecorder._combine`. A single device
   skips the pass entirely and is renamed.
 
+**Audio needs Microphone permission, and Screen Recording does not cover it.**
+macOS gates every audio *input* behind it, virtual devices included, so a
+terminal with screen access can still be refused BlackHole - which is exactly
+what happened the first time this was run outside the session that developed it.
+ffmpeg says `Failed to create AV capture input device: Cannot use <device>` and
+exits. Because the audio lives in a process of its own now, that failure does
+not stop the recording and nothing noticed it: the screen kept going and the
+file came out silent. `AvfAudioRecorder.verdict()` reports it and `check_audio()`
+puts it on `audio_error`/`mic_error`.
+
+**That check is polled, not waited for.** Measured against one refused device,
+the process died 0.14s into one attempt and 1.07s into the next, so there is no
+pause before "Recording" that both catches it and goes unnoticed - and on a
+resume the user would feel every one of those seconds. The wait loop asks once
+per pass instead, and `_report_problems` prints each complaint once. The
+recorder's stderr goes to a file beside its wav rather than a pipe, because
+nothing drains it while a recording runs.
+
 **The wav and the video do not start together, and which one is first varies.**
 The audio device opened 0.74s *before* the screen on a first segment and 1.02s
 *after* it on a segment following a pause, on the same machine. Both are stopped

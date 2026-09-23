@@ -70,6 +70,9 @@ def fake_backend(monkeypatch):
         limits_duration = False
         capture_ended = False
 
+        def check_audio(self):
+            pass
+
         def __init__(self, output, **kwargs):
             self.kwargs = kwargs
             self.output = output

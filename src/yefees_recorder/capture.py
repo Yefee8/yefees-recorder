@@ -311,6 +311,25 @@ class CaptureBackend(ABC):
         )
         self._segments.append((video, audio))
 
+    def check_audio(self) -> None:
+        """Ask a side recorder whether its device ever let it start.
+
+        Polled while the recording runs rather than waited for at the start: a
+        device that refuses can take anywhere from a seventh of a second to over
+        a second to say so. A failure is reported and not raised - the screen is
+        still worth having, and `_mux` already treats a missing wav as "video
+        only" - and whichever source was asked for carries the message, since
+        one recorder covers both.
+        """
+        verdict = getattr(self._audio, "verdict", None)
+        failure = verdict() if verdict else None
+        if not failure:
+            return
+        if self.want_audio:
+            self.audio_error = failure
+        else:
+            self.mic_error = failure
+
     def _end_segment(self) -> None:
         if self._proc is None:
             if self._audio is not None:

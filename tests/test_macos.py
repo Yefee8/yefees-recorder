@@ -253,6 +253,58 @@ def test_the_finished_files_are_mixed_without_normalising(listed, tmp_path):
     assert "normalize=0" in graph[graph.index("-filter_complex") + 1]
 
 
+class Stopped:
+    """A recorder process that has exited."""
+
+    def poll(self):
+        return 251
+
+
+class StillGoing:
+    def poll(self):
+        return None
+
+
+def test_a_refused_device_is_explained_rather_than_left_silent(listed, tmp_path):
+    """The screen still records, so nothing fails - which is exactly why the
+    user has to be told, or they keep a recording nobody knew was silent."""
+    recorder = MacBackend(tmp_path / "o.mp4").make_audio_recorder()
+    recorder._log = tmp_path / "seg0.log"
+    recorder._log.write_text(
+        "objc[123]: class `NSKVONotifying_AVCaptureScreenInput' not linked\n"
+        "[in#0 @ 0x7f8e] Failed to create AV capture input device: Cannot use BlackHole 2ch\n"
+        "Error opening input files: Input/output error\n",
+        encoding="utf-8",
+    )
+    recorder._proc = StillGoing()
+    assert recorder.verdict() is None
+
+    recorder._proc = Stopped()
+    complaint = recorder.verdict()
+    assert "Microphone" in complaint          # the permission it actually needs
+    assert "Cannot use BlackHole 2ch" in complaint   # what ffmpeg said first
+    assert "objc[" not in complaint                  # and not the runtime's noise
+    assert recorder.verdict() is complaint, "asked repeatedly, answered once"
+
+
+def test_the_complaint_lands_on_whichever_source_was_asked_for(listed, tmp_path):
+    """One recorder covers both devices, so its failure belongs to whichever of
+    them the user turned on."""
+    class Refused:
+        def verdict(self):
+            return "no audio device"
+
+    wanted_audio = MacBackend(tmp_path / "o.mp4", audio=True)
+    wanted_audio._audio = Refused()
+    wanted_audio.check_audio()
+    assert wanted_audio.audio_error == "no audio device"
+
+    wanted_mic = MacBackend(tmp_path / "o.mp4", audio=False, mic=True)
+    wanted_mic._audio = Refused()
+    wanted_mic.check_audio()
+    assert wanted_mic.mic_error == "no audio device"
+
+
 def test_one_device_needs_no_mixing_pass(listed, monkeypatch, tmp_path):
     """The common case is system audio alone; renaming beats re-encoding it."""
     recorder = MacBackend(tmp_path / "o.mp4").make_audio_recorder()

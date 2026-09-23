@@ -235,10 +235,8 @@ def record(
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(1)
 
-    if audio and getattr(backend, "audio_error", None):
-        console.print(f"[yellow]{backend.audio_error}[/]")
-    if mic and getattr(backend, "mic_error", None):
-        console.print(f"[yellow]{backend.mic_error}[/]")
+    reported: set[str] = set()
+    _report_problems(backend, reported)
 
     if keys.interactive():
         console.print("[green]Recording[/] - [bold]p[/] pause/resume, [bold]q[/] stop.")
@@ -250,7 +248,7 @@ def record(
     outcome: dict = {}
     finish = shutdown.install(lambda: _finish(backend, outcome))
 
-    _run_until_stopped(backend, duration)
+    _run_until_stopped(backend, duration, reported)
     console.print("Finishing up...")
     finish()
 
@@ -262,6 +260,22 @@ def record(
 
 PAUSE_KEYS = ("p", "P", " ")
 STOP_KEYS = ("q", "Q", keys.ESC)
+
+
+def _report_problems(backend, reported: set) -> None:
+    """Say what the recording could not do, once, whenever it turns out.
+
+    Not once at the start: a capture device that refuses took 0.14s to say so on
+    one attempt and 1.07s on the next, so the news can easily arrive after
+    recording has begun. Saying nothing would leave a silent recording nobody
+    knew was silent.
+    """
+    backend.check_audio()
+    for name in ("audio_error", "mic_error"):
+        message = getattr(backend, name, None)
+        if message and name not in reported:
+            reported.add(name)
+            console.print(f"[yellow]{message}[/]")
 
 
 def _toggle_pause(backend, paused: bool) -> bool:
@@ -283,12 +297,13 @@ def _toggle_pause(backend, paused: bool) -> bool:
     return not paused
 
 
-def _watch_for_keys(backend, deadline: float | None) -> None:
+def _watch_for_keys(backend, deadline: float | None, reported: set) -> None:
     """Handle pause and stop keys until one stops us, or the deadline passes."""
     paused = False
     while deadline is None or time.monotonic() < deadline:
         if backend.capture_ended:
             return  # it recorded its fill and stopped itself
+        _report_problems(backend, reported)
         key = keys.read_key(0.2)
         if key in PAUSE_KEYS:
             paused = _toggle_pause(backend, paused)
@@ -304,7 +319,7 @@ def _finish(backend, outcome: dict) -> None:
         outcome["error"] = exc
 
 
-def _run_until_stopped(backend, duration: float) -> None:
+def _run_until_stopped(backend, duration: float, reported: set | None = None) -> None:
     """Block until the user stops the recording, or `duration` runs out.
 
     Keys are read one at a time so pause and stop respond immediately without
@@ -318,7 +333,7 @@ def _run_until_stopped(backend, duration: float) -> None:
         deadline += STARTUP_GRACE
     try:
         with keys.raw_mode():
-            _watch_for_keys(backend, deadline)
+            _watch_for_keys(backend, deadline, reported if reported is not None else set())
     except KeyboardInterrupt:
         pass
 

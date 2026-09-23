@@ -120,6 +120,9 @@ class FakeBackend:
     limits_duration = False
     capture_ended = False
 
+    def check_audio(self):
+        """Asked each time round the loop; a fake never has anything to say."""
+
     def __init__(self):
         self.calls = []
 
@@ -201,10 +204,22 @@ def test_a_self_timing_recorder_is_given_grace_past_its_duration(monkeypatch, ba
     -t is there to recover."""
     backend.limits_duration = True
     deadlines = []
-    monkeypatch.setattr(cli, "_watch_for_keys", lambda b, deadline: deadlines.append(deadline))
+    monkeypatch.setattr(cli, "_watch_for_keys",
+                        lambda b, deadline, reported: deadlines.append(deadline))
     start = time.monotonic()
     cli._run_until_stopped(backend, 5)
     assert deadlines[0] - start > 5 + cli.STARTUP_GRACE - 1
+
+
+def test_a_problem_found_mid_recording_is_reported_once(monkeypatch, backend):
+    """A device can take over a second to refuse, so the news arrives after the
+    recording has started - and then it must not repeat every 0.2s."""
+    said = []
+    monkeypatch.setattr(cli.console, "print", lambda message, *a, **k: said.append(str(message)))
+    backend.audio_error = "the device would not open"
+    monkeypatch.setattr(keys, "read_key", scripted("x", "x", "x", "q"))
+    cli._run_until_stopped(backend, 0)
+    assert sum("would not open" in line for line in said) == 1
 
 
 def test_ctrl_c_stops_cleanly(monkeypatch, backend):
