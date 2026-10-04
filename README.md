@@ -7,10 +7,10 @@ the terminal goes away, and a settings menu so none of it needs flags.
 
 | Platform | Screen | System audio | Microphone |
 |---|---|---|---|
-| Windows | gdigrab | WASAPI loopback, no virtual cable needed | dshow |
+| Windows | ddagrab on the GPU, encoded by NVENC when there is one | WASAPI loopback, no virtual cable needed | WASAPI |
 | Linux / X11 | x11grab | PulseAudio / PipeWire sink monitor | PulseAudio source |
 | Linux / Wayland | wf-recorder (wlroots only — not GNOME/KDE) | sink monitor | one source only |
-| macOS | avfoundation | BlackHole or another virtual device | avfoundation |
+| macOS | avfoundation | BlackHole or another virtual device, via CoreAudio | CoreAudio |
 
 ## What has actually been tested
 
@@ -19,7 +19,7 @@ Worth knowing before you rely on it:
 | | Screen | Audio |
 |---|---|---|
 | **Windows** | recorded on real hardware | recorded on real hardware |
-| **macOS** | recorded on real hardware (14.5) | recorded on real hardware |
+| **macOS** | recorded on real hardware (14.5) | **rewritten since, not yet re-tested** |
 | **Linux / X11** | **not tested** | **not tested** |
 | **Linux / Wayland** | **never run at all** | **never run at all** |
 
@@ -144,7 +144,8 @@ yefees-recorder record --pick                        # choose from a menu instea
 `--display`, `--window` and `--region` are mutually exclusive — only one thing
 can be recorded at a time. Recording the whole desktop is the default, which on
 a multi-monitor machine means every monitor side by side; use `--display` for
-one of them.
+one of them. On Windows that matters for speed too: one monitor is captured on
+the GPU, every monitor at once only through the much slower GDI.
 
 Window capture is not available everywhere: Windows does it natively, X11 needs
 `wmctrl` installed, and macOS cannot do it at all.
@@ -212,6 +213,18 @@ yefees-recorder --install-completion
 
 ## Platform notes
 
+### Windows
+
+A monitor, or an area inside one, is copied on the GPU with Desktop
+Duplication (ffmpeg's `ddagrab`, ffmpeg 6 or newer) and, on an NVIDIA card,
+encoded there by NVENC, so a game keeps the CPU. Measured at 1080p60 on a GTX
+1660 Ti: the old GDI path managed 35 fps on 1.7 CPU cores, this one 55-60 fps on
+under 5% of one. Without NVENC the frame is handed to x264 instead. A window,
+or an area spanning monitors, still goes through GDI.
+
+Which of these a machine can do is tested with a one-frame recording when
+recording starts, which costs about half a second.
+
 ### macOS
 
 Grant **Screen Recording** to your terminal in System Settings > Privacy &
@@ -223,8 +236,11 @@ starts and `record` refuses rather than hanging.
 **Audio needs Microphone permission too**, in System Settings > Privacy &
 Security > Microphone, for the same terminal. macOS asks for it before handing
 over *any* audio input, virtual devices like BlackHole included, and without it
-the recording keeps the screen but has no sound — which the command says at the
-time rather than leaving you to discover it later.
+hands over silence instead — so `record` checks the permission first and says
+so, rather than leaving you with a silent recording to discover later.
+
+Audio is recorded through CoreAudio rather than ffmpeg: ffmpeg 8.1's
+avfoundation drops audio buffers, which came out as stuttering sound.
 
 System audio needs a loopback device, because macOS has no way to record its own
 output:

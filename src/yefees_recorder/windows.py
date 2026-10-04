@@ -1,31 +1,104 @@
-"""Windows backend: gdigrab for video, WASAPI loopback for system audio.
+"""Windows backend: ddagrab or gdigrab for video, WASAPI for all audio.
 
-dshow exposes no loopback device, so system audio cannot come from ffmpeg here -
-PyAudioWPatch captures it natively and the wav is muxed in afterwards.
+dshow exposes no loopback device, so system audio cannot come from ffmpeg here,
+and a dshow microphone in the capture process stalls the screen grab. So
+PyAudioWPatch records both, each to its own wav, mixed and muxed in afterwards.
 """
 
 from __future__ import annotations
 
 import ctypes
-import re
+import functools
 import subprocess
 import time
 import wave
 from ctypes import wintypes
 from pathlib import Path
 
-from .capture import AudioInput, CaptureBackend, Source
+from .capture import FFMPEG_BASE, CaptureBackend, MixedRecorder, Source
 
 DWMWA_CLOAKED = 14  # set on UWP windows that exist but are not really on screen
-
-# ffmpeg prints dshow devices as: [dshow @ ...] "Name here" (audio)
-DSHOW_AUDIO = re.compile(r'"([^"]+)"\s*\(audio\)')
 
 # Windows feeds a loopback stream only while something is actually playing - it
 # goes quiet mid-recording and may never fire at all on a silent machine. So the
 # wav is built against wall clock: every callback drops its data at the position
 # the clock says it belongs, and the gaps are filled with real silence.
 GAP_TOLERANCE = 0.01
+
+# NVENC constant-quality levels matched to the x264 settings each quality name
+# used to mean, by VMAF on 1080p60 gameplay. See CLAUDE.md, "Windows capture".
+NVENC_CQ = {"low": 42, "balanced": 36, "high": 27}
+
+SLOW_DESKTOP_WARNING = (
+    "Recording every monitor at once has to go through GDI, which is slow - "
+    "expect well under 60 fps and a busy CPU. Pass --display N to record one "
+    "monitor through the GPU instead."
+)
+
+
+class _DxgiOutputDesc(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_wchar * 32),
+        ("rect", wintypes.RECT),
+        ("attached", wintypes.BOOL),
+        ("rotation", ctypes.c_uint),
+        ("monitor", wintypes.HMONITOR),
+    ]
+
+
+def _com_method(obj, index: int, *argtypes):
+    table = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(table[index])
+
+
+def list_dxgi_outputs() -> list[tuple[int, int, int, int]]:
+    """Each output ddagrab can open, as (x, y, width, height), by its output_idx.
+
+    ddagrab numbers the outputs of the default adapter and says nothing about
+    which monitor an index is - and the order is not EnumDisplayMonitors'
+    either: here output 0 is \\\\.\\DISPLAY2. So they are matched by position.
+    """
+    guid = (ctypes.c_ubyte * 16).from_buffer_copy(  # IID_IDXGIFactory1
+        bytes.fromhex("78ae0a776ff2ba4da829253c83d1b387"))
+    factory, adapter = ctypes.c_void_p(), ctypes.c_void_p()
+    if ctypes.windll.dxgi.CreateDXGIFactory1(ctypes.byref(guid), ctypes.byref(factory)):
+        return []
+    outputs: list[tuple[int, int, int, int]] = []
+    try:
+        # vtable slot 7 is EnumAdapters on the factory and EnumOutputs on an
+        # adapter, GetDesc on an output; slot 2 is Release on all of them.
+        if _com_method(factory, 7, ctypes.c_uint, ctypes.c_void_p)(factory, 0, ctypes.byref(adapter)):
+            return []
+        while True:
+            output = ctypes.c_void_p()
+            if _com_method(adapter, 7, ctypes.c_uint, ctypes.c_void_p)(
+                    adapter, len(outputs), ctypes.byref(output)):
+                break
+            desc = _DxgiOutputDesc()
+            _com_method(output, 7, ctypes.c_void_p)(output, ctypes.byref(desc))
+            _com_method(output, 2)(output)
+            area = desc.rect
+            outputs.append((area.left, area.top, area.right - area.left, area.bottom - area.top))
+        _com_method(adapter, 2)(adapter)
+    finally:
+        _com_method(factory, 2)(factory)
+    return outputs
+
+
+@functools.lru_cache(maxsize=None)
+def ffmpeg_can(source: str, *codec: str) -> bool:
+    """Whether this machine's ffmpeg can push one frame of `source` through `codec`.
+
+    The only honest test for a hardware path: ddagrab needs ffmpeg 6 and a real
+    session, NVENC needs an NVIDIA GPU and driver, and neither says so up front.
+    """
+    try:
+        return subprocess.run(
+            FFMPEG_BASE + ["-f", "lavfi", "-i", source, "-frames:v", "1", *codec, "-f", "null", "-"],
+            capture_output=True, timeout=15,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def list_monitors() -> list[tuple[int, int, int, int]]:
@@ -81,39 +154,37 @@ def list_window_titles() -> list[str]:
     return titles
 
 
-def list_loopback_devices() -> list[str]:
+def _wasapi_devices(audio, pyaudio, loopback: bool) -> list[dict]:
+    """WASAPI capture devices: loopbacks (what is playing) or microphones."""
+    if loopback:
+        return list(audio.get_loopback_device_info_generator())
+    host = audio.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
+    devices = (audio.get_device_info_by_index(i) for i in range(audio.get_device_count()))
+    return [d for d in devices if d["hostApi"] == host and d["maxInputChannels"] > 0
+            and not d.get("isLoopbackDevice")]
+
+
+def _list_wasapi(loopback: bool) -> list[str]:
     try:
         import pyaudiowpatch as pyaudio
     except ImportError:
         return []
     audio = pyaudio.PyAudio()
     try:
-        return [device["name"] for device in audio.get_loopback_device_info_generator()]
+        return [device["name"] for device in _wasapi_devices(audio, pyaudio, loopback)]
     except Exception:
         return []
     finally:
         audio.terminate()
 
 
+def list_loopback_devices() -> list[str]:
+    return _list_wasapi(loopback=True)
+
+
 def list_microphones() -> list[str]:
-    """Microphone names dshow can open.
-
-    dshow has no loopback device, which is why system audio needs WASAPI - but
-    it lists and records microphones perfectly well.
-    """
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-f", "dshow", "-list_devices", "true", "-i", "dummy"],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    return DSHOW_AUDIO.findall(result.stderr)
-
-
-def default_microphone() -> str | None:
-    found = list_microphones()
-    return found[0] if found else None
+    """Microphones WASAPI can open - the same endpoint names dshow lists."""
+    return _list_wasapi(loopback=False)
 
 
 def list_sources() -> list[Source]:
@@ -127,16 +198,16 @@ def list_sources() -> list[Source]:
     return sources
 
 
-class WasapiLoopbackRecorder:
-    """Records whatever the default output device is playing, to a wav file."""
+class WasapiRecorder:
+    """Records one WASAPI device to a wav: a loopback of what is playing, or a mic."""
 
-    def __init__(self, device_name: str | None = None) -> None:
+    def __init__(self, device_name: str | None = None, loopback: bool = True) -> None:
         import pyaudiowpatch as pyaudio
 
         self._pyaudio = pyaudio
         self._pa = pyaudio.PyAudio()
         try:
-            self._device = self._find_device(device_name)
+            self._device = self._find_device(device_name, loopback)
         except Exception:
             self._pa.terminate()
             raise
@@ -147,15 +218,22 @@ class WasapiLoopbackRecorder:
         self._frames_written = 0
         self._start_time = None
 
-    def _find_device(self, device_name: str | None):
-        if device_name is None:
+    def _find_device(self, device_name: str | None, loopback: bool):
+        if device_name is None and loopback:
             return self._pa.get_default_wasapi_loopback()
+        if device_name is None:
+            host = self._pa.get_host_api_info_by_type(self._pyaudio.paWASAPI)
+            if host["defaultInputDevice"] < 0:
+                raise RuntimeError("No microphone found.")
+            return self._pa.get_device_info_by_index(host["defaultInputDevice"])
+        devices = _wasapi_devices(self._pa, self._pyaudio, loopback)
         wanted = device_name.lower()
-        for device in self._pa.get_loopback_device_info_generator():
+        for device in devices:
             if wanted in device["name"].lower():
                 return device
-        available = ", ".join(d["name"] for d in self._pa.get_loopback_device_info_generator())
-        raise RuntimeError(f"No loopback device matching {device_name!r}. Available: {available}")
+        kind = "loopback device" if loopback else "microphone"
+        available = ", ".join(d["name"] for d in devices)
+        raise RuntimeError(f"No {kind} matching {device_name!r}. Available: {available}")
 
     def _silence(self, frames: int) -> bytes:
         return b"\x00" * (frames * self.channels * 2)  # paInt16
@@ -217,7 +295,61 @@ class WindowsBackend(CaptureBackend):
             )
         return monitors[self.display]
 
+    def _ddagrab(self) -> str | None:
+        """A ddagrab source for what was asked, or None when only gdigrab can do it.
+
+        ddagrab sees one monitor at a time, so a window - and any area spanning
+        monitors, the whole desktop of a multi-monitor machine included - stays
+        on gdigrab.
+        """
+        if self.window:
+            return None
+        source = f"ddagrab=framerate={self.fps}"
+        outputs = list_dxgi_outputs()
+        area = self.region or self._display_region()
+        if area is None:
+            if len(outputs) == 1 == len(list_monitors()):
+                return source  # the whole desktop is that one output
+            if len(outputs) > 1:
+                self.video_warning = SLOW_DESKTOP_WARNING
+            return None
+        x, y, width, height = area
+        for index, (left, top, w, h) in enumerate(outputs):
+            if left <= x and top <= y and x + width <= left + w and y + height <= top + h:
+                # Even, for the encoders' 4:2:0; a GPU frame cannot be padded.
+                return (f"{source}:output_idx={index}:offset_x={x - left}:offset_y={y - top}"
+                        f":video_size={width - width % 2}x{height - height % 2}")
+        return None
+
+    @functools.cached_property
+    def _capture_path(self) -> tuple[str | None, bool]:
+        """(ddagrab source, or None for gdigrab; whether NVENC encodes it).
+
+        Measured at 1080p60 on a GTX 1660 Ti: gdigrab into x264 reached 35 fps on
+        170% of a core, ddagrab into NVENC 55-58 fps on 4.5%. ddagrab into x264
+        sits between, for a machine without NVENC.
+        """
+        grab = self._ddagrab()
+        if grab and ffmpeg_can(grab, "-c:v", "h264_nvenc"):
+            return grab, True
+        if grab and ffmpeg_can(grab + ",hwdownload,format=bgra"):
+            return grab + ",hwdownload,format=bgra", False
+        return None, False
+
+    def video_filters(self) -> list[str]:
+        # NVENC takes the GPU frame as it is; a software filter cannot touch it.
+        return [] if self._capture_path[1] else super().video_filters()
+
+    def video_codec_args(self) -> list[str]:
+        if not self._capture_path[1]:
+            return super().video_codec_args()
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr",
+                "-cq", str(NVENC_CQ[self.quality]), "-b:v", "0"]
+
     def video_input_args(self) -> list[str]:
+        grab = self._capture_path[0]
+        if grab:
+            return ["-f", "lavfi", "-i", grab]
         args = ["-f", "gdigrab", "-framerate", str(self.fps)]
         if self.window:
             # gdigrab targets a window by title natively, so no region maths.
@@ -241,22 +373,24 @@ class WindowsBackend(CaptureBackend):
             f"Output devices available here: {outputs}"
         )
 
-    def audio_inputs(self) -> list[AudioInput]:
-        # Only the microphone goes through ffmpeg here; system audio has to come
-        # from WASAPI because dshow exposes no loopback device.
-        if not self.want_mic:
-            return []
-        device = self.mic_device or default_microphone()
-        if device is None:
-            self.mic_error = "No microphone found; recording without it."
-            return []
-        return [AudioInput(["-f", "dshow", "-i", f"audio={device}"], self.mic_gain)]
-
     def make_audio_recorder(self):
-        if not self.want_audio:
-            return None
-        try:
-            return WasapiLoopbackRecorder(self.audio_device)
-        except Exception as exc:  # no loopback device, or PyAudioWPatch missing
-            self.audio_error = str(exc)
-            return None
+        """System audio and the microphone, both through WASAPI, mixed on stop.
+
+        The microphone used to be a dshow input in the capture process, and that
+        alone held 60 fps down to 20-24: dshow hands audio over in 500 ms blocks
+        and ffmpeg stalls the screen grab until each one arrives. Measured with
+        ddagrab: 59.5 fps alone, 24 fps beside the mic, no better than 52 with
+        the smallest audio_buffer_size.
+        """
+        devices = []
+        for label, wanted, name, loopback, gain in (
+            ("audio", self.want_audio, self.audio_device, True, self.audio_gain),
+            ("mic", self.want_mic, self.mic_device, False, self.mic_gain),
+        ):
+            if not wanted:
+                continue
+            try:
+                devices.append((label, WasapiRecorder(name, loopback), gain))
+            except Exception as exc:  # no such device, or PyAudioWPatch missing
+                setattr(self, f"{label}_error", f"{exc} Recording without it.")
+        return MixedRecorder(devices) if devices else None

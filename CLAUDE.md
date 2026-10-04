@@ -13,7 +13,9 @@ Verification status per platform:
 | Windows | verified on real hardware | verified on real hardware | local runs; `tests/test_windows.py` |
 | Linux X11 | **failing in CI** | **never run** | `tests/test_linux_capture.py` under Xvfb |
 | Linux Wayland | **never run** | **never run** | command construction only |
-| macOS | verified on real hardware (14.5, ffmpeg 8.1.2) | verified on real hardware | local runs; `tests/test_macos.py` |
+| macOS | verified on real hardware (14.5, ffmpeg 8.1.2) | **rewritten onto PortAudio, never run** | local runs; `tests/test_macos.py` |
+
+**macOS audio was rewritten from Windows and has not been heard since.** The old avfoundation path was verified, but it stuttered (see "macOS audio"), and its replacement could only be unit-tested. A first run on a Mac is a debugging session: check `microphone_permitted()` actually returns `True`, and measure with the beep train before trusting it.
 
 **Linux X11 was never verified; the test that would have verified it is red.** `test_x11grab_records_the_actual_display` paints the root window red and captures it, and under Xvfb it gets back `(1, 0, 2)` — black. It has failed every run, including the ones from before the macOS work, so this is not a regression and it is not new. It is also the test doing exactly what it was written for: a broken recorder here produces a valid file full of black frames rather than an error. **Fixing it needs a Linux machine to measure on — do not guess at it from another platform.**
 
@@ -59,17 +61,18 @@ So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. T
 
 `capture.py` owns the whole recording lifecycle; a backend subclass only answers *what* to capture. A new platform implements `video_input_args()` (and `make_audio_recorder()` if its audio cannot ride along with the screen) and registers itself in `get_backend()` — nothing else should need touching.
 
-The other hooks all default to "do what everyone else does", and exist because one platform measured differently: `video_filters()` (macOS crops a region after the fact), `output_options()` and `limits_duration` (macOS lets ffmpeg count the duration), `audio_lead()` and `side_audio_filters()` (macOS lines its wav up with the first frame and has already applied its gains), `setup()`/`teardown()` (Linux per-application audio) and `stop_signal` (Wayland is not ffmpeg). Adding a platform-specific argument belongs in a hook like these, not in an `if platform ==` inside `capture.py`.
+The other hooks all default to "do what everyone else does", and exist because one platform measured differently: `video_filters()` (macOS crops a region after the fact; Windows returns none for a GPU frame, which becomes the `null` filter), `video_codec_args()` (Windows swaps in NVENC), `output_options()` and `limits_duration` (macOS lets ffmpeg count the duration), `setup()`/`teardown()` (Linux per-application audio) and `stop_signal` (Wayland is not ffmpeg). Adding a platform-specific argument belongs in a hook like these, not in an `if platform ==` inside `capture.py`.
 
 - **ffmpeg is not bundled** into the pip package (size + GPL licensing). `doctor` checks for it and prints the OS-appropriate install command.
 - **Pause is implemented as segmentation.** ffmpeg has no pause. `pause()` ends the current ffmpeg process, `resume()` starts a new one, and `stop()` muxes each segment with its audio and concatenates them with `-c copy`. Wall-clock time spent paused therefore never reaches the output. Verified on macOS through a real terminal: 14.0s of wall clock with 3s of it paused produced 8.99s of video, and a beep train kept its spacing on both sides of the seam. **Every segment restarts the capture devices**, so each one pays the startup cost again and gets its own audio alignment — that is where the macOS lead correction earns its keep.
 - **Segments are `.mkv` internally** (survives an abrupt kill) and only the final concat writes the user's chosen extension.
-- **Audio arrives two ways, and Windows uses both at once.** `audio_inputs()` returns one argument list per input ffmpeg can capture directly; `make_audio_recorder()` returns a side recorder whose wav is muxed in on stop. Linux puts system audio *and* the microphone through `audio_inputs()`. Windows can only put the **microphone** there (dshow records mics fine, it just has no loopback), so system audio stays a side recorder and the two are mixed at mux time. macOS puts *everything* in the side recorder for a different reason again — its capture sessions starve each other.
+- **Audio arrives two ways.** `audio_inputs()` returns one argument list per input ffmpeg captures in the screen's own process; `make_audio_recorder()` returns a side recorder whose wav is muxed in on stop. Linux puts system audio *and* the microphone through `audio_inputs()`. Windows and macOS put *everything* in a `MixedRecorder` (one wav per device, mixed at each device's gain on stop), for different measured reasons: on Windows a dshow mic in the capture process held 60 fps down to 20 (see "Windows capture"), and on macOS avfoundation inputs starve each other and drop audio buffers (see "macOS audio"). Linux has not been measured for the same stall.
+- **The wav is lined up with the first frame by its length** (`audio_lead()`): both are stopped within milliseconds of each other, so whatever one has over the other it has at the front. That only holds because `FFMPEG_BASE` passes `-stats_period 0.02` — ffmpeg reads the "q" on stdin once a stats period, 0.5s by default, and capture ran on 0.28-0.40s past the request while the side audio stopped at once. Measured with wall-clock frame stamps: 0.01-0.10s with the flag. A signal stops it within 35 ms, but exits 255 and needs a shared console on Windows.
 - **Per-application audio only works on Linux.** `setup()`/`teardown()` on `CaptureBackend` exist for it: the Linux backend loads a null sink plus a `module-loopback` back to the real output (without that second module the user stops hearing the app they are recording), moves the app's sink-input across, and unloads both on stop. `teardown()` runs even when `start()` fails. Windows would need the process-loopback API and macOS Core Audio process taps, neither reachable through ffmpeg, so both raise an error naming the routing workaround instead.
 - **Microphone gain is not cosmetic.** A mic sits roughly 30 dB below system audio, so without `mic_gain` a voice is inaudible in the mix even though it is recorded correctly. Verified against a synthetic tone: gain 2 gives exactly +6.0 dB, gain 4 gives +12.0 dB.
-- **`amix` must be given `normalize=0`.** By default it scales every input by 1/n, so switching the microphone on quietens system audio — measured at 4.4 dB (mean −8.6 → −13.0 dB). Both mix sites set it, and a test pins it.
+- **`amix` must be given `normalize=0`.** By default it scales every input by 1/n, so switching the microphone on quietens system audio — measured at 4.4 dB (mean −8.6 → −13.0 dB). Both mix sites (`capture_command` for Linux, `MixedRecorder` for the rest) set it, and a test pins it.
 - **`-vf` and `-filter_complex` cannot both be passed.** When there is more than one audio input the video filter chain moves into the complex graph as `[0:v]...[vout]`, so anything added to `video_filters()` must keep working in both shapes.
-- **Windows audio does not come from ffmpeg.** dshow exposes no loopback device (verified: `-list_devices` shows only a microphone), so `PyAudioWPatch` captures WASAPI loopback to a wav that is muxed in afterwards.
+- **Windows audio does not come from ffmpeg.** dshow exposes no loopback device (verified: `-list_devices` shows only a microphone), so `PyAudioWPatch` captures WASAPI loopback to a wav that is muxed in afterwards — and the microphone through WASAPI too, under the same endpoint name dshow lists, so saved `mic_device` values kept working.
 - **Record the sink's `.monitor`, not the default source** — the plain default PulseAudio source is the microphone, not system audio.
 - **The loopback wav is built against wall clock, not against the device.** Windows only feeds a loopback stream while something is actually playing — on a fully silent machine the callback never fires at all, and mid-recording silence produces gaps. `WasapiLoopbackRecorder` therefore pads with real silence up to the elapsed-time position on every callback and again at stop. Removing that padding silently desyncs audio from video. Measured after the fix: beeps 4.000 s apart in the source land 3.998 / 4.001 / 3.998 s apart in the output.
 - **`--audio-offset` is a deliberate calibration knob**, not dead config: residual constant A/V offset depends on how fast a given machine's audio endpoint spins up.
@@ -80,64 +83,85 @@ The other hooks all default to "do what everyone else does", and exist because o
 - **Wayland source selection cannot be automated** — the `xdg-desktop-portal` dialog is an OS security boundary and the user must pick the screen/window there.
 - Backend selection is `platform.system()` plus `XDG_SESSION_TYPE` on Linux, in `get_backend()`.
 
+## Windows capture (measured, do not retry)
+
+Measured at 1080p60 on a GTX 1660 Ti / i5-9400F, with the user's real config
+(system audio + a dshow microphone, `--display 0`):
+
+| | fps reached | ffmpeg CPU | ffmpeg working set |
+|---|---|---|---|
+| gdigrab, whole two-monitor desktop, x264 | 21.5 | 180% of a core | 691 MiB |
+| gdigrab, one monitor, x264 | 35 | 170% | 368 MiB |
+| ... with the dshow mic in the same process | **20.5** | | |
+| ddagrab, one monitor, NVENC | 55-60 | 4.5% | 166-176 MiB |
+| ddagrab, one monitor, hwdownload into x264 | 54 | 204% | 383 MiB |
+
+- **The mic was the worst of it.** dshow hands audio over in 500 ms blocks and
+  ffmpeg's scheduler stalls the other input until each one arrives. gdigrab and
+  ddagrab are both *pull* sources, so a stalled input is frames never captured:
+  ddagrab went from 59.5 fps alone to 24 beside the mic, and `-audio_buffer_size`
+  down to 5 ms only got it to 50-52. That is why the microphone moved to WASAPI.
+- **ddagrab hands NVENC a D3D11 frame.** No software filter or `-pix_fmt` may
+  touch it, so `video_filters()` returns nothing (the `null` filter) and the
+  codec args carry no pixel format. NVENC tags the output BT.601 limited, and the
+  decoded colours matched a GDI grab at 39.3 dB PSNR, better than x264 medium's
+  37.8 on the same frame.
+- **`NVENC_CQ` was calibrated by VMAF** against x264 on three 8 s segments of
+  1080p60 gameplay: cq 27 matches `high` (x264 medium crf 20) to within 0.1 VMAF
+  at the same size; cq 36 beats `balanced` (veryfast crf 26) by ~1 VMAF at
+  ~85% of the size; cq 42 beats `low` by ~3 VMAF at the same size.
+- **ddagrab numbers outputs its own way.** Output 0 was `\.\DISPLAY2` here.
+  `list_dxgi_outputs()` reads each output's desktop rectangle through DXGI
+  (ctypes COM) and areas are matched by position; verified on two monitors by
+  PSNR (same monitor 62 dB / identical, crossed 8 dB).
+- **ddagrab sees one output.** A window, an area spanning monitors, and the
+  default whole desktop of a multi-monitor machine stay on gdigrab, and the last
+  one prints `SLOW_DESKTOP_WARNING`. The default was not changed to "primary
+  monitor" because the README documents it as every monitor.
+- **The path is probed, not assumed**: `ffmpeg_can()` pushes one frame through
+  ddagrab into NVENC, then ddagrab alone (~0.56 s), once per backend. The
+  command is built before the side audio starts so that time is not counted as
+  sound ahead of the first frame.
+- **ddagrab stamps frames with the wall clock**, so a late grab is a gap rather
+  than a stretched frame: 55-58 fps with 15-50 gaps in 8 s under load.
+- ddagrab + NVENC takes ~0.2-0.36 s to its first frame where gdigrab took
+  ~0.05, which is what `audio_lead()` now measures on Windows too.
+- Not done: AMD (AMF) and Intel (QSV) encoders. They need hardware to calibrate
+  on; until then those machines get ddagrab into x264.
+
 ## macOS audio (measured, do not retry)
 
-The first real run of this backend found three separate faults in the audio
-path, each measured against a 1 kHz beep played into BlackHole once a second.
-Every one of them produces a plausible file, so none announce themselves.
+**The stutter was ffmpeg dropping audio.** In 8.1, avfoundation's capture
+delegate keeps a single audio buffer and *releases* it when the next one lands
+before it was read; when there is nothing waiting, the demuxer returns EAGAIN
+and the ffmpeg CLI sleeps 10 ms. A 6.4s capture held 4.80s of audio, and the
+`aresample=async=1` that put the surviving samples back where they belonged
+filled every hole with silence - which is what "stuttering audio" was. It has
+nothing to do with the frame rate. `-thread_queue_size` did not help because
+that queue sits after the slot. Upstream fixed it on 2026-07-03 (ddf8f40, "wait
+for frame consumption to avoid dropping A/V frames"), in no release yet.
 
-- **avfoundation delivers honest timestamps with samples missing between them.**
-  A 6.4s capture held 4.80s of audio; ffmpeg's own accounting said
-  `time=00:00:08.08` over 305,152 samples, which is 6.36s. Decoding what arrives
-  packs the sound into three quarters of the recording and walks it out of sync
-  with the picture — beeps a second apart came back 0.75s apart. Every audio
-  input therefore carries `aresample=async=1` (`AUDIO_GAP_FILLER`), which is the
-  same hole Windows fills by padding its loopback wav against the clock.
-- **Two avfoundation inputs cannot share an ffmpeg process.** Captured alone the
-  audio keeps all eight beeps and their spacing; put the screen in the same
-  ffmpeg and two ragged fragments come back, because the capture session
-  starves. `-thread_queue_size 4096` changes nothing — measured, identical
-  output. Two *audio* inputs share a process perfectly well, which is why
-  `AvfAudioRecorder` exists: one process for what is seen, one for everything
-  that is heard.
-- **amix cannot mix these streams live either.** With it between the devices and
-  the file, whole beeps arrive as 50ms fragments, with or without
-  `dropout_transition=0`. Each device is written to its own wav and they are
-  mixed once they are finished, in `AvfAudioRecorder._combine`. A single device
-  skips the pass entirely and is renamed.
+So audio no longer goes through ffmpeg at all: `SounddeviceRecorder` opens each
+device through PortAudio (the `sounddevice` wheel bundles it, darwin only) and
+`MixedRecorder` mixes the wavs on stop. What the old path measured still shapes
+this one:
+
+- **Two avfoundation inputs cannot share an ffmpeg process.** With the screen
+  and the audio in one process, eight beeps came back as two ragged fragments.
+- **amix cannot mix these streams live.** Whole beeps arrived as 50 ms
+  fragments; each device is written to its own wav and mixed afterwards.
+- **The wav and the video do not start together, and which one is first
+  varies**: the audio opened 0.74s before the screen on a first segment and
+  1.02s after it on a segment following a pause. `audio_lead()` measures it per
+  segment. Do not replace it with a constant.
 
 **Audio needs Microphone permission, and Screen Recording does not cover it.**
-macOS gates every audio *input* behind it, virtual devices included, so a
-terminal with screen access can still be refused BlackHole - which is exactly
-what happened the first time this was run outside the session that developed it.
-ffmpeg says `Failed to create AV capture input device: Cannot use <device>` and
-exits. Because the audio lives in a process of its own now, that failure does
-not stop the recording and nothing noticed it: the screen kept going and the
-file came out silent. `AvfAudioRecorder.verdict()` reports it and `check_audio()`
-puts it on `audio_error`/`mic_error`.
-
-**That check is polled, not waited for.** Measured against one refused device,
-the process died 0.14s into one attempt and 1.07s into the next, so there is no
-pause before "Recording" that both catches it and goes unnoticed - and on a
-resume the user would feel every one of those seconds. The wait loop asks once
-per pass instead, and `_report_problems` prints each complaint once. The
-recorder's stderr goes to a file beside its wav rather than a pipe, because
-nothing drains it while a recording runs.
-
-**The wav and the video do not start together, and which one is first varies.**
-The audio device opened 0.74s *before* the screen on a first segment and 1.02s
-*after* it on a segment following a pause, on the same machine. Both are stopped
-within milliseconds of each other by design (see the comment in
-`_end_segment`), so whatever length one has over the other it has at the front,
-and `audio_lead()` measures it per segment. A positive lead is seeked past with
-`-ss`; a negative one is padded with real silence via `adelay`, because the
-segments are concatenated with `-c copy` afterwards and a gap in the timestamps
-is the muxer's to interpret while samples are not. Left alone this accumulates:
-one pause put the sound 0.85s ahead of the picture.
-
-Do not replace any of this with a constant. The numbers above moved by a factor
-of two between runs on one machine, because a cold device opens slower than a
-warm one.
+Every audio input is gated behind it, virtual devices included. ffmpeg used to
+fail loudly when refused; CoreAudio instead hands over silence. So
+`microphone_permitted()` asks `AVCaptureDevice authorizationStatusForMediaType:`
+for `"soun"` through the ObjC runtime (ctypes, no dependency) before recording.
+Only an explicit `False` is treated as refused - `None` means macOS has not
+asked yet, and opening the device is what makes it ask.
 
 ## Duration on macOS
 
@@ -167,7 +191,7 @@ would change how `--duration` ends on platforms this was not measured on.
 
 | | display | window | region |
 |---|---|---|---|
-| Windows | `-offset_x/-offset_y/-video_size` from `EnumDisplayMonitors` | native `-i title=...` | same offset args |
+| Windows | ddagrab `output_idx` of the DXGI output at that monitor's position; gdigrab offsets as a fallback | gdigrab's native `-i title=...` | ddagrab offsets inside the output holding it, else gdigrab |
 | Linux X11 | offset appended to `DISPLAY` as `:0+x,y` | `-window_id` from `wmctrl` | same |
 | Linux Wayland | unsupported | unsupported | `wf-recorder -g` |
 | macOS | a different avfoundation device | **impossible** | `crop` filter after capture |
@@ -181,7 +205,7 @@ Things that bite here:
 - **Monitor offsets can be negative** on both Windows and X11 when a monitor sits left of or above the primary, so `parse_region` and the xrandr regex both accept a leading `-`.
 - **`--window` with x11grab must not also pass `-video_size`** — the window's own size wins.
 
-Quality is `low`/`balanced`/`high` mapping to an x264 preset plus CRF. Even `high` stays at `medium` rather than a slow preset: capture is realtime, and dropping frames costs more than bitrate does. Measured on 4s of 1920x1080: 127 / 278 / 323 KiB.
+Quality is `low`/`balanced`/`high` mapping to an x264 preset plus CRF, or on NVENC to the `NVENC_CQ` level VMAF matched to it. Even `high` stays at `medium` rather than a slow preset: capture is realtime, and dropping frames costs more than bitrate does. Measured on 4s of 1920x1080: 127 / 278 / 323 KiB.
 
 ## Hotkeys
 

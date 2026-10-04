@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from yefees_recorder.capture import CaptureBackend
+from yefees_recorder.capture import CaptureBackend, MixedRecorder
 
 pytestmark = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
 
@@ -112,6 +112,68 @@ def test_a_wav_that_starts_late_is_padded_up_to_the_first_frame(tmp_path):
     this it would run a segment further ahead at every pause."""
     video, audio = muxed_with_lead(tmp_path, -0.5, 2.0, 1.5)
     assert abs(audio - video) < 0.15, "the missing half second should be silence"
+
+
+class ToneRecorder:
+    """A device that 'records' a second of tone, or silence, or refuses to open."""
+
+    def __init__(self, volume=0.5, refuse=False):
+        self.volume, self.refuse = volume, refuse
+
+    def start(self, path):
+        if self.refuse:
+            raise OSError("device busy")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                        f"sine=frequency=440:duration=1,volume={self.volume}", str(path)], check=True)
+
+    def stop(self):
+        pass
+
+
+def mean_volume(path):
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+                         capture_output=True, text=True).stderr
+    return float(out.split("mean_volume: ")[1].split(" dB")[0])
+
+
+def test_each_device_gets_its_own_gain(tmp_path):
+    """A microphone sits ~30 dB under system audio, so its gain is not cosmetic."""
+    plain, lifted = tmp_path / "plain.wav", tmp_path / "lifted.wav"
+    for target, gain in ((plain, 1.0), (lifted, 2.0)):
+        recorder = MixedRecorder([("mic", ToneRecorder(), gain)])
+        recorder.start(target)
+        recorder.stop()
+    assert abs(mean_volume(lifted) - mean_volume(plain) - 6.0) < 0.1
+
+
+def test_adding_a_device_does_not_quieten_the_other(tmp_path):
+    """amix scales every input by 1/n unless told not to - measured at 4.4 dB
+    the first time the microphone was switched on."""
+    alone, mixed = tmp_path / "alone.wav", tmp_path / "mixed.wav"
+    for target, devices in ((alone, [("audio", ToneRecorder(), 1.0)]),
+                            (mixed, [("audio", ToneRecorder(), 1.0), ("mic", ToneRecorder(0), 1.0)])):
+        recorder = MixedRecorder(devices)
+        recorder.start(target)
+        recorder.stop()
+    assert abs(mean_volume(mixed) - mean_volume(alone)) < 0.1
+
+
+def test_one_device_at_unity_is_renamed_not_reencoded(tmp_path):
+    recorder = MixedRecorder([("audio", ToneRecorder(), 1.0)])
+    recorder.start(tmp_path / "s.wav")
+    recorder.stop()
+    assert (tmp_path / "s.wav").exists() and not (tmp_path / "s-0.wav").exists()
+
+
+def test_a_device_that_will_not_open_leaves_the_other_recording(tmp_path):
+    backend = FakeBackend(tmp_path / "out.mp4", mic=True)
+    backend._audio = MixedRecorder([("audio", ToneRecorder(), 1.0), ("mic", ToneRecorder(refuse=True), 1.0)])
+    backend._audio.start(tmp_path / "s.wav")
+    backend.check_audio()
+    assert "device busy" in backend.mic_error
+    assert getattr(backend, "audio_error", None) is None
+    backend._audio.stop()
+    assert (tmp_path / "s.wav").exists()
 
 
 def test_start_twice_is_an_error(tmp_path):

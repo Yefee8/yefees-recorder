@@ -271,7 +271,7 @@ def _report_problems(backend, reported: set) -> None:
     knew was silent.
     """
     backend.check_audio()
-    for name in ("audio_error", "mic_error"):
+    for name in ("video_warning", "audio_error", "mic_error"):
         message = getattr(backend, name, None)
         if message and name not in reported:
             reported.add(name)

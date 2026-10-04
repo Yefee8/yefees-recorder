@@ -1,6 +1,6 @@
 [project]
 name = "yefees-recorder"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cross-platform screen recorder CLI built on mpv"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -25,6 +25,8 @@ dependencies = [
     "typer>=0.15",
     "rich>=13.9",
     "pyaudiowpatch>=0.2.12.8; sys_platform == 'win32'",
+    # Bundles PortAudio in its macOS wheel; ffmpeg 8.1 drops avfoundation audio.
+    "sounddevice>=0.5; sys_platform == 'darwin'",
     "platformdirs>=4.11.12",
     "tomli>=2.4.1 ; python_full_version < '3.11'",
 ]
