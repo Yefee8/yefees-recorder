@@ -1,6 +1,6 @@
 [project]
 name = "yefees-recorder"
-version = "0.1.1"
+version = "0.2.0"
 description = "Cross-platform screen recorder CLI built on mpv"
 readme = "README.md"
 license = "GPL-3.0-or-later"
