@@ -61,9 +61,12 @@ jobs:
         run: uv run yefees-recorder doctor || true
 
       # xvfb-run provides the DISPLAY that turns on the real x11grab capture test.
+      # -noreset: Xvfb resets when its last client disconnects, and the test's
+      # xsetroot is the only client - so the red it painted was wiped back to
+      # black before x11grab ever connected, and the test failed on every run.
       - name: Test (under a virtual display)
         if: runner.os == 'Linux'
-        run: xvfb-run -a --server-args="-screen 0 1280x720x24" uv run pytest -v
+        run: xvfb-run -a --server-args="-screen 0 1280x720x24 -noreset" uv run pytest -v
 
       - name: Test
         if: runner.os != 'Linux'
