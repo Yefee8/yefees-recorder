@@ -20,16 +20,16 @@ Worth knowing before you rely on it:
 |---|---|---|
 | **Windows** | recorded on real hardware | recorded on real hardware |
 | **macOS** | recorded on real hardware (14.5) | **rewritten since, not yet re-tested** |
-| **Linux / X11** | **not tested** | **not tested** |
+| **Linux / X11** | recorded in CI, on a virtual display only | **not tested** |
 | **Linux / Wayland** | **never run at all** | **never run at all** |
 
 **Nobody working on this has a Linux machine.** The Linux backends are written
 and covered by unit tests, and CI runs the X11 capture test against a virtual
-display — where it currently **fails**: it paints the screen red, records it,
-and gets black frames back. That failure is honest rather than hidden, because a
-broken recorder here produces a perfectly valid file full of black frames and no
-error at all. Until someone runs it on a real Linux desktop, treat Linux as
-unproven.
+display: it paints the screen red, records it, and checks the frames really are
+red — a broken recorder here produces a perfectly valid file full of black
+frames and no error at all. That passes, but a virtual display is not a desktop,
+and nobody has heard Linux audio. Until someone runs it on a real Linux desktop,
+treat Linux as unproven.
 
 Bug reports from a real Linux session are very welcome, and the most useful ones
 say what `yefees-recorder doctor` printed and whether the recorded file is black.

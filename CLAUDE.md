@@ -11,13 +11,13 @@ Verification status per platform:
 | | Screen capture | Audio | Where it is proven |
 |---|---|---|---|
 | Windows | verified on real hardware | verified on real hardware | local runs; `tests/test_windows.py` |
-| Linux X11 | **failing in CI** | **never run** | `tests/test_linux_capture.py` under Xvfb |
+| Linux X11 | verified in CI, on Xvfb only | **never run** | `tests/test_linux_capture.py` under Xvfb |
 | Linux Wayland | **never run** | **never run** | command construction only |
 | macOS | verified on real hardware (14.5, ffmpeg 8.1.2) | **rewritten onto PortAudio, never run** | local runs; `tests/test_macos.py` |
 
 **macOS audio was rewritten from Windows and has not been heard since.** The old avfoundation path was verified, but it stuttered (see "macOS audio"), and its replacement could only be unit-tested. A first run on a Mac is a debugging session: check `microphone_permitted()` actually returns `True`, and measure with the beep train before trusting it.
 
-**Linux X11 was never verified; the test that would have verified it is red.** `test_x11grab_records_the_actual_display` paints the root window red and captures it, and under Xvfb it gets back `(1, 0, 2)` — black. It has failed every run, including the ones from before the macOS work, so this is not a regression and it is not new. It is also the test doing exactly what it was written for: a broken recorder here produces a valid file full of black frames rather than an error. **Fixing it needs a Linux machine to measure on — do not guess at it from another platform.**
+**Linux X11 capture passes in CI, on a virtual display only.** `test_x11grab_records_the_actual_display` paints the root window red and checks the captured frames are red, because a broken recorder here produces a valid file full of black frames rather than an error. For its first months it got back `(1, 0, 2)` — black — on every run, and the recorder was not the problem: Xvfb resets when its last client disconnects, and the test's `xsetroot` was the only client, so the red was wiped before x11grab connected. CI now starts Xvfb with `-noreset`, and the test went green on the first run with it. No real Linux desktop has run it.
 
 That test covers capture and nothing else, so Linux audio is unproven too: nobody has heard it. The macOS session found two bugs in `keys.py` that break every menu on POSIX (see "Hotkeys"), and Xvfb would not have caught either, because the capture test does not press a key.
 
@@ -284,7 +284,7 @@ Prefer plain ASCII in strings this project controls; the em dash was removed fro
 `.github/workflows/ci.yml` runs Linux (3.10 floor and 3.13), macOS and Windows. Things worth knowing before editing it:
 
 - **`pyaudiowpatch` is marked `sys_platform == 'win32'`.** It publishes Windows-only wheels, so without the marker Linux and macOS try to build PyAudio from source and the install fails.
-- **The Linux job runs pytest under `xvfb-run`.** That `DISPLAY` is the entire reason `tests/test_linux_capture.py` executes rather than skipping — it paints the root window red with `xsetroot` and asserts the captured frames are actually red, because a recorder failure here yields a valid file full of black frames, not an error.
+- **The Linux job runs pytest under `xvfb-run`.** That `DISPLAY` is the entire reason `tests/test_linux_capture.py` executes rather than skipping — it paints the root window red with `xsetroot` and asserts the captured frames are actually red, because a recorder failure here yields a valid file full of black frames, not an error. **Keep `-noreset` in the server args**: without it Xvfb resets as `xsetroot` exits and the test sees black.
 - **The macOS `doctor` step is allowed to fail.** A hosted runner cannot be granted Screen Recording permission, so `doctor` correctly exits non-zero there. Don't "fix" that by weakening `doctor`. The *tests* must still pass, which is why `test_doctor_passes_when_tools_present` stubs the permission check rather than depending on the machine.
 - **What CI can and cannot catch.** Everything that needs a keyboard, a real audio device or Screen Recording permission is outside its reach. The arrow-key and busy-spin bugs in `keys.py` lived through the whole project because every test replaced `read_key`; `test_keys_decode_off_a_real_terminal` closes that particular hole with a pty, but nothing covers the menus end to end. A change to `menu.py` or `editor.py` still wants a person at a terminal.
 - `uv sync --locked` fails the build if `pyproject.toml` changed without relocking.
