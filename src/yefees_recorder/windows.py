@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import ctypes
 import functools
-import subprocess
 import time
 import wave
 from ctypes import wintypes
 from pathlib import Path
 
-from .capture import FFMPEG_BASE, CaptureBackend, MixedRecorder, Source
+from .capture import NVENC_CQ, CaptureBackend, MixedRecorder, Source, ffmpeg_can
 
 DWMWA_CLOAKED = 14  # set on UWP windows that exist but are not really on screen
 
@@ -24,10 +23,6 @@ DWMWA_CLOAKED = 14  # set on UWP windows that exist but are not really on screen
 # wav is built against wall clock: every callback drops its data at the position
 # the clock says it belongs, and the gaps are filled with real silence.
 GAP_TOLERANCE = 0.01
-
-# NVENC constant-quality levels matched to the x264 settings each quality name
-# used to mean, by VMAF on 1080p60 gameplay. See CLAUDE.md, "Windows capture".
-NVENC_CQ = {"low": 42, "balanced": 36, "high": 27}
 
 SLOW_DESKTOP_WARNING = (
     "Recording every monitor at once has to go through GDI, which is slow - "
@@ -83,22 +78,6 @@ def list_dxgi_outputs() -> list[tuple[int, int, int, int]]:
     finally:
         _com_method(factory, 2)(factory)
     return outputs
-
-
-@functools.lru_cache(maxsize=None)
-def ffmpeg_can(source: str, *codec: str) -> bool:
-    """Whether this machine's ffmpeg can push one frame of `source` through `codec`.
-
-    The only honest test for a hardware path: ddagrab needs ffmpeg 6 and a real
-    session, NVENC needs an NVIDIA GPU and driver, and neither says so up front.
-    """
-    try:
-        return subprocess.run(
-            FFMPEG_BASE + ["-f", "lavfi", "-i", source, "-frames:v", "1", *codec, "-f", "null", "-"],
-            capture_output=True, timeout=15,
-        ).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
 
 
 def list_monitors() -> list[tuple[int, int, int, int]]:

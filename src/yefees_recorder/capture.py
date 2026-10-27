@@ -14,6 +14,7 @@ with its own recorder and keeps the rest of the lifecycle.
 
 from __future__ import annotations
 
+import functools
 import os
 import subprocess
 import tempfile
@@ -40,6 +41,10 @@ QUALITY_PRESETS = {
     "balanced": ("veryfast", 26),
     "high": ("medium", 20),
 }
+
+# NVENC constant-quality levels matched to the x264 settings each quality name
+# used to mean, by VMAF on 1080p60 gameplay. See CLAUDE.md, "Windows capture".
+NVENC_CQ = {"low": 42, "balanced": 36, "high": 27}
 
 REGION = re.compile(r"^\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*x\s*(\d+)\s*$")
 
@@ -101,6 +106,22 @@ def _run(args: list[str]) -> None:
     proc = subprocess.run(FFMPEG_BASE + args, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr.strip()[-400:]}")
+
+
+@functools.lru_cache(maxsize=None)
+def ffmpeg_can(source: str, *codec: str) -> bool:
+    """Whether this machine's ffmpeg can push one frame of `source` through `codec`.
+
+    The only honest test for a hardware path: ddagrab needs ffmpeg 6 and a real
+    session, NVENC needs an NVIDIA GPU and driver, and neither says so up front.
+    """
+    try:
+        return subprocess.run(
+            FFMPEG_BASE + ["-f", "lavfi", "-i", source, "-frames:v", "1", *codec, "-f", "null", "-"],
+            capture_output=True, timeout=15,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 class MixedRecorder:
@@ -253,6 +274,15 @@ class CaptureBackend(ABC):
         """Extra ffmpeg options for the segment, just before its file name."""
         return []
 
+    def capture_log(self, segment: Path) -> Path | None:
+        """Where the capture process's own output goes; None leaves it on the terminal.
+
+        ffmpeg runs at -loglevel error and says nothing until something breaks.
+        A recorder with no quiet switch would print over the key prompts, so its
+        output goes to a file, and is shown only if the segment came out empty.
+        """
+        return None
+
     def capture_command(self, output: Path) -> list[str]:
         """The full command recording one segment to `output`."""
         inputs = self.audio_inputs()
@@ -365,7 +395,8 @@ class CaptureBackend(ABC):
             if video.exists() and video.stat().st_size > 0
         ]
         if not parts:
-            raise RuntimeError("ffmpeg captured nothing — try `yefees-recorder doctor`")
+            raise RuntimeError("ffmpeg captured nothing — try `yefees-recorder doctor`"
+                               + self._what_the_recorder_said())
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self._concat(parts)
         self._tmpdir.cleanup()
@@ -379,6 +410,7 @@ class CaptureBackend(ABC):
         # measuring earlier segments), and a side recorder would count all of it
         # as sound that came before the first frame.
         command = self.capture_command(video)
+        log = self.capture_log(video)
         audio = None
         if self.want_audio or self.want_mic:
             recorder = self.make_audio_recorder()
@@ -386,12 +418,29 @@ class CaptureBackend(ABC):
                 audio = self.workdir / f"seg{index}.wav"
                 recorder.start(audio)
                 self._audio = recorder
-        self._proc = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            creationflags=_NEW_GROUP,
-        )
+        chatter = open(log, "wb") if log else None  # None inherits our terminal
+        try:
+            self._proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=chatter,
+                stderr=chatter,
+                creationflags=_NEW_GROUP,
+            )
+        finally:
+            if chatter is not None:
+                chatter.close()  # the child has its own copy
         self._segments.append((video, audio))
+
+    def _what_the_recorder_said(self) -> str:
+        """The tail of the last segment's capture log, for an error message."""
+        if not self._segments:
+            return ""
+        log = self.capture_log(self._segments[-1][0])
+        if log is None or not log.exists():
+            return ""
+        said = log.read_text(encoding="utf-8", errors="replace").strip()
+        return f"\n{said[-600:]}" if said else ""
 
     def check_audio(self) -> None:
         """Put any device the side recorder could not open on `<label>_error`.

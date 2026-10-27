@@ -9,7 +9,7 @@ the terminal goes away, and a settings menu so none of it needs flags.
 |---|---|---|---|
 | Windows | ddagrab on the GPU, encoded by NVENC when there is one | WASAPI loopback, no virtual cable needed | WASAPI |
 | Linux / X11 | x11grab | PulseAudio / PipeWire sink monitor | PulseAudio source |
-| Linux / Wayland | wf-recorder (wlroots only — not GNOME/KDE) | sink monitor | one source only |
+| Linux / Wayland | wf-recorder (wlroots only — not GNOME/KDE), encoded by NVENC when there is one | sink monitor | PulseAudio source, mixed in by PipeWire |
 | macOS | avfoundation | BlackHole or another virtual device, via CoreAudio | CoreAudio |
 
 ## What has actually been tested
@@ -21,15 +21,14 @@ Worth knowing before you rely on it:
 | **Windows** | recorded on real hardware | recorded on real hardware |
 | **macOS** | recorded on real hardware (14.5) | **rewritten since, not yet re-tested** |
 | **Linux / X11** | recorded in CI, on a virtual display only | **not tested** |
-| **Linux / Wayland** | **never run at all** | **never run at all** |
+| **Linux / Wayland** | recorded on real hardware (Arch, Hyprland, NVIDIA) | recorded on real hardware, A/V sync measured |
 
-**Nobody working on this has a Linux machine.** The Linux backends are written
-and covered by unit tests, and CI runs the X11 capture test against a virtual
-display: it paints the screen red, records it, and checks the frames really are
-red — a broken recorder here produces a perfectly valid file full of black
-frames and no error at all. That passes, but a virtual display is not a desktop,
-and nobody has heard Linux audio. Until someone runs it on a real Linux desktop,
-treat Linux as unproven.
+Wayland has been run on one real desktop: Arch Linux with Hyprland, two
+monitors and an NVIDIA card. Other wlroots compositors (Sway, river) and AMD or
+Intel graphics have not been tried. X11 is covered by CI against a virtual
+display only: it paints the screen red, records it, and checks the frames
+really are red — a broken recorder there produces a perfectly valid file full
+of black frames and no error at all. Nobody has heard X11 audio yet.
 
 Bug reports from a real Linux session are very welcome, and the most useful ones
 say what `yefees-recorder doctor` printed and whether the recorded file is black.
@@ -52,7 +51,8 @@ On Wayland you also need `wf-recorder`, because ffmpeg cannot capture a Wayland
 screen at all:
 
 ```bash
-sudo apt install wf-recorder
+sudo apt install wf-recorder   # Debian / Ubuntu
+sudo pacman -S wf-recorder     # Arch
 ```
 
 ### 2. The recorder
@@ -182,7 +182,8 @@ yefees-recorder record --app-audio "Firefox"
 ```
 
 Only Linux can do this directly, by routing that application through a capture
-sink with `pactl` and putting it back when the recording ends. On Windows and
+sink with `pactl` and putting it back when the recording ends. So far that is
+wired up for X11 sessions only, not Wayland. On Windows and
 macOS the operating system offers no way for ffmpeg to capture a single
 application, so the command explains the alternative instead: send the app to
 its own output device (Windows: Settings > System > Sound > Volume mixer;
@@ -275,9 +276,19 @@ xdg-desktop-portal/PipeWire — so `wf-recorder` is required. It supports wlroot
 compositors (Sway, Hyprland, river). On GNOME or KDE, use your desktop's own
 recorder or run an X11 session.
 
-Wayland also asks *you* to pick the screen or window in its own dialog; that
-choice is an operating-system security boundary and cannot be automated, so
-`--display` and `--window` are unavailable there.
+wf-recorder records **one monitor at a time**. `--display N` picks it (see
+`sources`; on Hyprland the list shows where each monitor sits). Without it the
+focused monitor is recorded, and with more than one connected the command says
+which. `--region` works too, in the compositor's layout coordinates. `--window`
+is not available: wf-recorder can only be pointed at a monitor or an area.
+
+With an NVIDIA card the video is encoded by NVENC: at 1080p60 that measured 22%
+of one CPU core against 112% for x264. Elsewhere x264 is used.
+
+System audio and the microphone can be recorded together. While both are on,
+or a gain other than 1 is set, the recorder loads a temporary PipeWire mix sink
+(`yefees_mix`) for the length of the recording; this needs `pactl` (`libpulse`
+on Arch). `--audio-offset` has no effect on Wayland.
 
 ## Configuration
 

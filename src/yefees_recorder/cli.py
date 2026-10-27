@@ -29,8 +29,11 @@ console = Console()
 INSTALL_HINTS = {
     "Windows": {"ffmpeg": "winget install Gyan.FFmpeg"},
     "Darwin": {"ffmpeg": "brew install ffmpeg"},
-    "Linux": {"ffmpeg": "sudo apt install ffmpeg", "wf-recorder": "sudo apt install wf-recorder"},
 }
+
+# Linux has no one installer; the first of these present on the machine is used.
+# The packages are named ffmpeg and wf-recorder on all three.
+LINUX_INSTALLERS = {"pacman": "sudo pacman -S {}", "dnf": "sudo dnf install {}", "apt": "sudo apt install {}"}
 
 
 def required_tools() -> tuple[str, ...]:
@@ -44,7 +47,12 @@ def required_tools() -> tuple[str, ...]:
 
 def install_hint(tool: str, system: str | None = None) -> str:
     """Install command for `tool` on `system`, or a generic nudge on unknown platforms."""
-    hints = INSTALL_HINTS.get(system or platform.system(), {})
+    system = system or platform.system()
+    if system == "Linux":
+        for installer, command in LINUX_INSTALLERS.items():
+            if shutil.which(installer):
+                return command.format(tool)
+    hints = INSTALL_HINTS.get(system, {})
     return hints.get(tool, f"install {tool} with your package manager")
 
 
@@ -216,6 +224,18 @@ def record(
         directory = user_config.resolve("output_dir", None, settings)
         folder = Path(directory).expanduser() if directory else Path.cwd()
         output = folder / f"recording-{datetime.now():%Y%m%d-%H%M%S}.mp4"
+
+    # Checked now, not when the file is written: by then the whole recording
+    # exists only in a temporary folder that is deleted on exit. An output_dir
+
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        problem = None if os.access(output.parent, os.W_OK) else "permission denied"
+    except OSError as exc:
+        problem = exc.strerror or str(exc)
+    if problem:
+        console.print(f"[red]Cannot write to {output.parent}: {problem}[/]")
+        raise typer.Exit(1)
 
     try:
         backend = get_backend(

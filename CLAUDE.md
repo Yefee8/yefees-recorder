@@ -12,7 +12,7 @@ Verification status per platform:
 |---|---|---|---|
 | Windows | verified on real hardware | verified on real hardware | local runs; `tests/test_windows.py` |
 | Linux X11 | verified in CI, on Xvfb only | **never run** | `tests/test_linux_capture.py` under Xvfb |
-| Linux Wayland | **never run** | **never run** | command construction only |
+| Linux Wayland | verified on real hardware (Arch, Hyprland 2 monitors, GTX 1660 Ti, wf-recorder 0.6.0, ffmpeg 9.0.2) | verified on real hardware, A/V measured | local runs; `tests/test_linux.py` |
 | macOS | verified on real hardware (14.5, ffmpeg 8.1.2) | **rewritten onto PortAudio, never run** | local runs; `tests/test_macos.py` |
 
 **macOS audio was rewritten from Windows and has not been heard since.** The old avfoundation path was verified, but it stuttered (see "macOS audio"), and its replacement could only be unit-tested. A first run on a Mac is a debugging session: check `microphone_permitted()` actually returns `True`, and measure with the beep train before trusting it.
@@ -21,7 +21,7 @@ Verification status per platform:
 
 That test covers capture and nothing else, so Linux audio is unproven too: nobody has heard it. The macOS session found two bugs in `keys.py` that break every menu on POSIX (see "Hotkeys"), and Xvfb would not have caught either, because the capture test does not press a key.
 
-Wayland remains unproven; treat a first real run there as a debugging session.
+Wayland has run on one desktop: Arch with Hyprland and NVIDIA, through a real terminal with pause and stop. Sway/river and AMD/Intel graphics have not been tried (see "Wayland capture").
 
 `plan.md` (gitignored, Turkish) holds the phase order and remains the roadmap, **but its central technical premise turned out to be wrong — see "Why not mpv" below.** Trust this file over `plan.md` on engine choice.
 
@@ -57,16 +57,85 @@ Wayland gives no direct screen access: it goes through `xdg-desktop-portal` over
 
 So `LinuxWaylandBackend` shells out to `wf-recorder` and stops it with SIGINT. That covers wlroots compositors (Sway, Hyprland, river) and **not GNOME or KDE** — supporting those properly means writing a real D-Bus portal client plus a PipeWire consumer, which is a project of its own, not a patch.
 
+## Wayland capture (measured, do not retry)
+
+Measured at 1080p60 on Arch/Hyprland with a GTX 1660 Ti, against `mpv` playing
+`testsrc2` fullscreen. Read wf-recorder's source before changing anything here:
+most of what follows is its `main.cpp` behaving as written.
+
+| | fps | wf-recorder CPU | Hyprland CPU |
+|---|---|---|---|
+| wf-recorder's default (libx264), what this backend used to run | 64 (VFR) | 112% of a core | 23% |
+| `-c libx264 -p preset=veryfast -p crf=26` (`balanced`) | 60 | 112% | 23% |
+| `-c h264_nvenc -x yuv420p` | 60 | 46% | 14% |
+| `-c h264_nvenc -x bgr0` | 60 | 19.5% | 13.5% |
+| the backend now: `-D -r 60`, NVENC bgr0, audio mixed in PipeWire | 59.9 | 22% | +9% over idle; PipeWire +2% |
+
+- **Always pass `-o` or `-g`.** With several outputs and neither, wf-recorder
+  asks *on stdin* which one to record. stdin is our pipe, so it waited there
+  forever and the recording came out empty ("ffmpeg captured nothing"). This
+  was the bug that made Wayland unusable on a two-monitor machine.
+- **Always pass `-D`.** By default a frame is only taken when the screen
+  changes. On a still screen SIGINT then went unanswered until something
+  moved (17 s once, past our 15 s kill), and `-r` with a still screen wrote a
+  561-byte unreadable file.
+- **`-x bgr0` for NVENC**, so the RGB-to-YUV conversion happens on the GPU. It
+  tags BT.601 limited like Windows, and `NVENC_CQ` is shared with Windows
+  because it is the same encoder on the same card. `yuv420p` put the
+  conversion back on the CPU and came out tagged full range.
+- **Outputs come from `hyprctl monitors -j`, never xrandr.** XWayland invents
+  its own layout and put HDMI-A-1 at x=0 where Hyprland had DP-1. Other
+  compositors fall back to the names from `wf-recorder -L`, in the same order.
+- **wf-recorder has no quiet switch**, so `capture_log()` sends its output to a
+  file next to the segment, and that file's tail goes into the error if the
+  segment comes out empty.
+- RSS is 600-800 MiB with NVENC: 16 shared 8 MB frame buffers plus ~170 MB of
+  driver mappings (`/dev/nvidiactl`). That is wf-recorder's design, not a leak.
+
+**Audio goes through wf-recorder, never beside it.** A side wav lined up by
+length (`audio_lead`, the Windows/macOS approach) came out 50-120 ms early in
+every run, because both of wf-recorder's tails are lossy: on SIGINT its writer
+loop breaks at once and the frames still in its 16-buffer ring and the `fps`
+filter are dropped (video 51-91 ms short against a wav stopped with it), and
+its own audio track loses 13-83 ms. What *is* exact is how it starts:
+`write_loop` drops frames until its audio reader has a time base and starts the
+video clock there. So with one source at gain 1 the source goes straight to
+`--audio`, and otherwise `setup()` loads a `module-null-sink` (`yefees_mix`)
+with one `module-loopback` per source, sets each loopback's sink-input volume
+to its gain, and wf-recorder records `yefees_mix.monitor`.
+
+Measured with a flash-and-beep clip (beep audio going to a null sink, so
+nothing is audible): direct +5 to +39 ms; through the mix, two sources and a
+pause, -22 to +20 ms with no drift across the seam. Things that bite:
+
+- `set-sink-input-volume` must get a decimal (`4.000000`): pactl reads a bare
+  integer as a raw volume, so a gain of 2 would be 2/65536.
+- **Loopbacks carry `state.restore-props=false`** on both streams. WirePlumber
+  saves stream volumes in `~/.local/state/wireplumber/stream-properties` keyed
+  by `media.name`, and pipewire-pulse names loopbacks `loopback-<pid>-<n>`,
+  which repeat run to run. Without the property it raced our volume (one run of
+  four came out at unity gain) and would hand a gain-1 source the previous
+  run's gain. With it, it neither restores nor saves. Gains then measured
+  exact: 1.5x +3.5 dB, 2x +6.0 dB, 4x +12.0 dB.
+- Loopbacks carry `sink_dont_move=true` and are unloaded before the sink. A
+  loopback that outlives its sink moves to the default output and plays the
+  microphone out loud. `_unload_leftovers` clears a mix a killed run left
+  behind, loopbacks first.
+- `-fragment_size` would matter for a side recorder: PipeWire hands an ffmpeg
+  `pulse` input samples every 43 ms (sometimes 85) by default, every 11 ms at
+  `-fragment_size 1920`. Nothing uses that now.
+- `--audio-offset` does nothing on Wayland, since nothing is muxed afterwards.
+
 ## Architecture
 
 `capture.py` owns the whole recording lifecycle; a backend subclass only answers *what* to capture. A new platform implements `video_input_args()` (and `make_audio_recorder()` if its audio cannot ride along with the screen) and registers itself in `get_backend()` — nothing else should need touching.
 
-The other hooks all default to "do what everyone else does", and exist because one platform measured differently: `video_filters()` (macOS crops a region after the fact; Windows returns none for a GPU frame, which becomes the `null` filter), `video_codec_args()` (Windows swaps in NVENC), `output_options()` and `limits_duration` (macOS lets ffmpeg count the duration), `setup()`/`teardown()` (Linux per-application audio) and `stop_signal` (Wayland is not ffmpeg). Adding a platform-specific argument belongs in a hook like these, not in an `if platform ==` inside `capture.py`.
+The other hooks all default to "do what everyone else does", and exist because one platform measured differently: `video_filters()` (macOS crops a region after the fact; Windows returns none for a GPU frame, which becomes the `null` filter), `video_codec_args()` (Windows swaps in NVENC), `output_options()` and `limits_duration` (macOS lets ffmpeg count the duration), `setup()`/`teardown()` (Linux per-application audio, and Wayland's audio mix), `stop_signal` (Wayland is not ffmpeg) and `capture_log()` (wf-recorder cannot be told to be quiet). Adding a platform-specific argument belongs in a hook like these, not in an `if platform ==` inside `capture.py`.
 
 - **ffmpeg is not bundled** into the pip package (size + GPL licensing). `doctor` checks for it and prints the OS-appropriate install command.
 - **Pause is implemented as segmentation.** ffmpeg has no pause. `pause()` ends the current ffmpeg process, `resume()` starts a new one, and `stop()` muxes each segment with its audio and concatenates them with `-c copy`. Wall-clock time spent paused therefore never reaches the output. Verified on macOS through a real terminal: 14.0s of wall clock with 3s of it paused produced 8.99s of video, and a beep train kept its spacing on both sides of the seam. **Every segment restarts the capture devices**, so each one pays the startup cost again and gets its own audio alignment — that is where the macOS lead correction earns its keep.
 - **Segments are `.mkv` internally** (survives an abrupt kill) and only the final concat writes the user's chosen extension.
-- **Audio arrives two ways.** `audio_inputs()` returns one argument list per input ffmpeg captures in the screen's own process; `make_audio_recorder()` returns a side recorder whose wav is muxed in on stop. Linux puts system audio *and* the microphone through `audio_inputs()`. Windows and macOS put *everything* in a `MixedRecorder` (one wav per device, mixed at each device's gain on stop), for different measured reasons: on Windows a dshow mic in the capture process held 60 fps down to 20 (see "Windows capture"), and on macOS avfoundation inputs starve each other and drop audio buffers (see "macOS audio"). Linux has not been measured for the same stall.
+- **Audio arrives two ways.** `audio_inputs()` returns one argument list per input ffmpeg captures in the screen's own process; `make_audio_recorder()` returns a side recorder whose wav is muxed in on stop. Linux X11 puts system audio *and* the microphone through `audio_inputs()`; Wayland uses neither, because wf-recorder records the audio itself (see "Wayland capture"). Windows and macOS put *everything* in a `MixedRecorder` (one wav per device, mixed at each device's gain on stop), for different measured reasons: on Windows a dshow mic in the capture process held 60 fps down to 20 (see "Windows capture"), and on macOS avfoundation inputs starve each other and drop audio buffers (see "macOS audio"). Linux has not been measured for the same stall.
 - **The wav is lined up with the first frame by its length** (`audio_lead()`): both are stopped within milliseconds of each other, so whatever one has over the other it has at the front. That only holds because `FFMPEG_BASE` passes `-stats_period 0.02` — ffmpeg reads the "q" on stdin once a stats period, 0.5s by default, and capture ran on 0.28-0.40s past the request while the side audio stopped at once. Measured with wall-clock frame stamps: 0.01-0.10s with the flag. A signal stops it within 35 ms, but exits 255 and needs a shared console on Windows.
 - **Per-application audio only works on Linux.** `setup()`/`teardown()` on `CaptureBackend` exist for it: the Linux backend loads a null sink plus a `module-loopback` back to the real output (without that second module the user stops hearing the app they are recording), moves the app's sink-input across, and unloads both on stop. `teardown()` runs even when `start()` fails. Windows would need the process-loopback API and macOS Core Audio process taps, neither reachable through ffmpeg, so both raise an error naming the routing workaround instead.
 - **Microphone gain is not cosmetic.** A mic sits roughly 30 dB below system audio, so without `mic_gain` a voice is inaudible in the mix even though it is recorded correctly. Verified against a synthetic tone: gain 2 gives exactly +6.0 dB, gain 4 gives +12.0 dB.
@@ -80,7 +149,7 @@ The other hooks all default to "do what everyone else does", and exist because o
 - **macOS has no native system-audio loopback** — it needs a virtual device like BlackHole, which appears as an avfoundation *input*. Missing one downgrades to video-only rather than failing.
 - **avfoundation addresses a device as `video:audio`**, and the screen is always opened as `screen:none` — the combined `screen:audio` form drifts between the streams. Audio is not opened in that process at all; see "macOS audio" below.
 - **Device indices are discovered, never hardcoded** — `-list_devices` writes to stderr and exits non-zero by design, so the exit code is ignored and stderr is parsed. The camera is usually index 0 and the screen 1, and the microphone sits at audio 0 ahead of the loopback device, so picking index 0 gets you a webcam and a mic.
-- **Wayland source selection cannot be automated** — the `xdg-desktop-portal` dialog is an OS security boundary and the user must pick the screen/window there.
+- **Wayland source selection goes to wf-recorder as `-o`/`-g`.** wlroots screencopy shows no portal dialog, so nothing has to be picked by hand; that dialog only exists on the GNOME/KDE portal path, which this backend does not take.
 - Backend selection is `platform.system()` plus `XDG_SESSION_TYPE` on Linux, in `get_backend()`.
 
 ## Windows capture (measured, do not retry)
@@ -193,7 +262,7 @@ would change how `--duration` ends on platforms this was not measured on.
 |---|---|---|---|
 | Windows | ddagrab `output_idx` of the DXGI output at that monitor's position; gdigrab offsets as a fallback | gdigrab's native `-i title=...` | ddagrab offsets inside the output holding it, else gdigrab |
 | Linux X11 | offset appended to `DISPLAY` as `:0+x,y` | `-window_id` from `wmctrl` | same |
-| Linux Wayland | unsupported | unsupported | `wf-recorder -g` |
+| Linux Wayland | `wf-recorder -o NAME`, focused output by default | unsupported | `wf-recorder -g` |
 | macOS | a different avfoundation device | **impossible** | `crop` filter after capture |
 
 Things that bite here:

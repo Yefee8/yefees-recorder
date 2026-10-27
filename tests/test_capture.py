@@ -176,6 +176,25 @@ def test_a_device_that_will_not_open_leaves_the_other_recording(tmp_path):
     assert (tmp_path / "s.wav").exists()
 
 
+class ChattyBackend(FakeBackend):
+    """A recorder that prints and records nothing, with its output in a log."""
+
+    def capture_log(self, segment):
+        return segment.with_suffix(".log")
+
+    def capture_command(self, output):
+        return ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nosuchsource", str(output)]
+
+
+def test_a_logged_recorder_says_why_it_captured_nothing(tmp_path, capfd):
+    backend = ChattyBackend(tmp_path / "out.mp4", audio=False)
+    backend.start()
+    backend._proc.wait(timeout=10)
+    with pytest.raises(RuntimeError, match="nosuchsource"):
+        backend.stop()
+    assert "nosuchsource" not in capfd.readouterr().err, "kept off the terminal"
+
+
 def test_start_twice_is_an_error(tmp_path):
     backend = FakeBackend(tmp_path / "out.mp4", fps=10, audio=False)
     backend.start()
